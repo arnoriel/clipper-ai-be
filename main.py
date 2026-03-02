@@ -49,8 +49,6 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 # Model priority — dicoba berurutan kalau yang sebelumnya gagal/timeout
 AI_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",  # paling stabil & cepat
-    "mistralai/mistral-7b-instruct:free",        # fallback cepat
     "arcee-ai/trinity-large-preview:free",       # fallback terakhir
 ]
 
