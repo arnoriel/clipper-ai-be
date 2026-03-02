@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: clipper-ai-be
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "http://localhost:5173,https://viral-clipper-ai.vercel.app"
+      - key: PORT
+        value: "3001"
