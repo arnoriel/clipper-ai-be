@@ -690,6 +690,49 @@ def build_ffmpeg_filters(
 # YOUTUBE HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Clients ordered by reliability on headless/server IPs (no PO token needed)
+_YT_CLIENTS = ["TV_EMBED", "ANDROID", "IOS", "MWEB", "WEB_EMBED"]
+
+
+def _yt_with_fallback(url: str) -> "YouTube":
+    """
+    Try multiple pytubefix clients in order until one succeeds.
+    TV_EMBED is most reliable on shared server IPs (Render, Railway, etc.)
+    because it uses the TV embedded player API which has no bot checks.
+    """
+    last_exc: Exception = RuntimeError("No clients tried")
+    for client in _YT_CLIENTS:
+        try:
+            yt = YouTube(url, client=client)
+            # Force metadata fetch to catch errors early
+            _ = yt.title
+            print(f"   ✅ YouTube client '{client}' worked for: {url[:60]}")
+            return yt
+        except Exception as e:
+            print(f"   ⚠️  YouTube client '{client}' failed: {e!s:.80}")
+            last_exc = e
+    raise last_exc
+
+# Clients ordered by reliability on headless server IPs (no PO token required)
+_YT_CLIENTS = ["TVHTML5EMBEDS", "TVHTML5", "IOS", "ANDROID", "MWEB"]
+
+
+def _make_yt(url: str) -> "YouTube":
+    """Try each client until one succeeds (avoids bot-detection 400s)."""
+    last_exc: Exception = RuntimeError("No clients tried")
+    for client in _YT_CLIENTS:
+        try:
+            yt = YouTube(url, client=client)
+            # Force metadata fetch to trigger any error early
+            _ = yt.title
+            print(f"✅ YouTube client '{client}' OK for {url[:60]}")
+            return yt
+        except Exception as e:
+            print(f"⚠️  YouTube client '{client}' failed: {e}")
+            last_exc = e
+    raise last_exc
+
+
 def _sanitize_filename(title: str) -> str:
     """Remove characters unsafe for filenames."""
     safe = re.sub(r'[\\/*?:"<>|]', "", title)
@@ -788,7 +831,7 @@ async def youtube_info(url: str):
         loop = asyncio.get_event_loop()
 
         def _fetch():
-            yt = YouTube(url, client="IOS")
+            yt = _yt_with_fallback(url)
             # Access attributes to force metadata load
             title     = yt.title
             length    = yt.length
@@ -855,7 +898,7 @@ async def download_youtube(
 
         # ── Resolve metadata + pick stream (blocking, run in executor) ────────
         def _prepare():
-            yt     = YouTube(url, client="IOS")
+            yt     = _yt_with_fallback(url)
             title  = yt.title or "youtube_video"
             length = yt.length or 0
             stream = _pick_best_stream(yt, max_resolution)
