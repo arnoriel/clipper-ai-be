@@ -700,7 +700,7 @@ def _sanitize_filename(title: str) -> str:
 def _pick_best_stream(yt: "YouTube", max_resolution: int = 720):
     """
     Pick best progressive (video+audio) mp4 stream ≤ max_resolution.
-    Falls back to any mp4 if no progressive stream found.
+    IOS client may only have progressive streams; falls back gracefully.
     """
     progressive = (
         yt.streams
@@ -719,7 +719,17 @@ def _pick_best_stream(yt: "YouTube", max_resolution: int = 720):
             break
 
     if not chosen:
+        # Fallback: any progressive mp4
         chosen = progressive.last()
+
+    if not chosen:
+        # Last resort: highest res mp4 regardless of type
+        chosen = (
+            yt.streams
+            .filter(file_extension="mp4")
+            .order_by("resolution")
+            .last()
+        )
 
     return chosen
 
@@ -778,7 +788,7 @@ async def youtube_info(url: str):
         loop = asyncio.get_event_loop()
 
         def _fetch():
-            yt = YouTube(url)
+            yt = YouTube(url, client="IOS")
             # Access attributes to force metadata load
             title     = yt.title
             length    = yt.length
@@ -845,7 +855,7 @@ async def download_youtube(
 
         # ── Resolve metadata + pick stream (blocking, run in executor) ────────
         def _prepare():
-            yt     = YouTube(url)
+            yt     = YouTube(url, client="IOS")
             title  = yt.title or "youtube_video"
             length = yt.length or 0
             stream = _pick_best_stream(yt, max_resolution)
