@@ -26,8 +26,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import shutil
 
+# ─── pytubefix (YouTube download) ─────────────────────────────────────────────
+try:
+    from pytubefix import YouTube
+    PYTUBEFIX_OK = True
+    print("✅ pytubefix available — YouTube download enabled")
+except ImportError:
+    PYTUBEFIX_OK = False
+    print("⚠️  pytubefix not installed — YouTube download disabled. Run: pip install pytubefix")
+
 # ─── App ──────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AI Viral Clipper Backend", version="3.0.0")
+app = FastAPI(title="AI Viral Clipper Backend", version="3.1.0")
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
@@ -40,7 +49,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-File-Name"],
+    expose_headers=["X-File-Name", "X-Video-Title", "X-Video-Duration", "Content-Length"],
 )
 
 # ─── AI Config ────────────────────────────────────────────────────────────────
@@ -262,10 +271,10 @@ async def extract_audio_segment(
         "-ss", str(start_sec),
         "-i", str(video_path),
         "-t", str(duration_sec),
-        "-vn",                          # no video
+        "-vn",
         "-acodec", "libmp3lame",
         "-ab", "128k",
-        "-ar", "16000",                 # Whisper prefers 16kHz
+        "-ar", "16000",
         str(output_path),
     ]
     proc = subprocess.run(cmd, capture_output=True, timeout=120)
@@ -273,10 +282,6 @@ async def extract_audio_segment(
 
 
 def _whisper_available_provider() -> tuple[str, str]:
-    """
-    Return (provider_name, api_key) for the first available STT provider.
-    Priority: Groq (FREE) → OpenAI → local faster-whisper (no key needed)
-    """
     if GROQ_API_KEY:
         return ("groq", GROQ_API_KEY)
     if OPENAI_API_KEY:
@@ -285,11 +290,6 @@ def _whisper_available_provider() -> tuple[str, str]:
 
 
 async def call_whisper_groq(audio_path: Path, language: Optional[str] = None) -> dict:
-    """
-    Groq Whisper — FREE tier, very fast, word timestamps.
-    Endpoint mirrors OpenAI's audio/transcriptions API.
-    Model: whisper-large-v3-turbo (fastest) or whisper-large-v3
-    """
     endpoint = "https://api.groq.com/openai/v1/audio/transcriptions"
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
@@ -297,7 +297,7 @@ async def call_whisper_groq(audio_path: Path, language: Optional[str] = None) ->
             audio_bytes = f.read()
 
         data = {
-            "model":             "whisper-large-v3-turbo",  # Free on Groq
+            "model":             "whisper-large-v3-turbo",
             "response_format":   "verbose_json",
             "timestamp_granularities[]": "word",
         }
@@ -317,10 +317,8 @@ async def call_whisper_groq(audio_path: Path, language: Optional[str] = None) ->
             raise HTTPException(502, f"Groq Whisper error {resp.status_code}: {resp.text[:300]}")
 
         result = resp.json()
-        # Groq returns words inside segments; flatten if needed
         words = result.get("words", [])
         if not words:
-            # Try extracting from segments
             for seg in result.get("segments", []):
                 for w in seg.get("words", []):
                     words.append(w)
@@ -330,7 +328,6 @@ async def call_whisper_groq(audio_path: Path, language: Optional[str] = None) ->
 
 
 async def call_whisper_openai(audio_path: Path, language: Optional[str] = None) -> dict:
-    """OpenAI Whisper API — requires paid credits."""
     endpoint = "https://api.openai.com/v1/audio/transcriptions"
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
@@ -361,11 +358,6 @@ async def call_whisper_openai(audio_path: Path, language: Optional[str] = None) 
 
 
 def call_whisper_local(audio_path: Path, language: Optional[str] = None) -> dict:
-    """
-    Local faster-whisper transcription — no API key needed, runs on CPU.
-    Install: pip install faster-whisper
-    Downloads model on first run (~150 MB for 'base').
-    """
     try:
         from faster_whisper import WhisperModel  # type: ignore
     except ImportError:
@@ -402,12 +394,6 @@ def call_whisper_local(audio_path: Path, language: Optional[str] = None) -> dict
 
 
 async def call_whisper_api(audio_path: Path, language: Optional[str] = None) -> dict:
-    """
-    Auto-select STT provider:
-      1. Groq  (GROQ_API_KEY)    — FREE, recommended
-      2. OpenAI (OPENAI_API_KEY) — paid
-      3. local faster-whisper    — no key needed, slower
-    """
     provider, _ = _whisper_available_provider()
     print(f"🎙️  STT provider: {provider}")
 
@@ -429,11 +415,6 @@ def group_words_to_subtitles(
     words: list[dict],
     words_per_chunk: int = 3,
 ) -> list[dict]:
-    """
-    Group word-level timestamps into N-word subtitle chunks.
-    Each word dict has keys: word, start, end.
-    Returns list of { text, start, end }.
-    """
     subtitles = []
     for i in range(0, len(words), words_per_chunk):
         chunk = words[i : i + words_per_chunk]
@@ -563,7 +544,6 @@ def escape_drawtext(text: str) -> str:
     return text
 
 
-# ── Font reference width: font size disimpan sbg "px di 1080px lebar" ─────────
 FONT_REFERENCE_WIDTH = 1080.0
 
 
@@ -573,7 +553,6 @@ def build_ffmpeg_filters(
 ) -> list[str]:
     filters: list[str] = []
 
-    # ── Aspect ratio crop ────────────────────────────────────────────────────
     aspect_ratio = edits.get("aspectRatio", "original")
     if aspect_ratio and aspect_ratio != "original":
         rw, rh = [int(x) for x in aspect_ratio.split(":")]
@@ -581,7 +560,6 @@ def build_ffmpeg_filters(
         crop_h = f"if(gt(iw/ih\\,{rw}/{rh})\\,ih\\,trunc(iw*{rh}/{rw}/2)*2)"
         filters.append(f"crop={crop_w}:{crop_h}:(iw-out_w)/2:(ih-out_h)/2")
 
-    # ── Color eq ─────────────────────────────────────────────────────────────
     eq_parts   = []
     brightness = edits.get("brightness", 0)
     contrast   = edits.get("contrast", 0)
@@ -595,12 +573,10 @@ def build_ffmpeg_filters(
     if eq_parts:
         filters.append(f"eq={':'.join(eq_parts)}")
 
-    # ── Speed ─────────────────────────────────────────────────────────────────
     speed = edits.get("speed", 1)
     if speed and speed != 1:
         filters.append(f"setpts={1 / speed:.6f}*PTS")
 
-    # ── Text overlays ─────────────────────────────────────────────────────────
     text_overlays = edits.get("textOverlays", [])
     if not DRAWTEXT_OK and text_overlays:
         print("⚠️  Subtitles skipped — ffmpeg missing drawtext filter")
@@ -626,9 +602,6 @@ def build_ffmpeg_filters(
         else:
             font_part = ""
 
-        # ── Font size: disimpan sebagai px di referensi 1080px lebar.
-        # Pakai ekspresi ffmpeg `w * ratio` supaya otomatis scale ke
-        # resolusi output setelah crop (9:16, 1:1, dll).
         font_size_stored = float(t.get("fontSize", 36))
         font_size_ratio  = font_size_stored / FONT_REFERENCE_WIDTH
         font_size_expr   = f"w*{font_size_ratio:.6f}"
@@ -671,7 +644,6 @@ def build_ffmpeg_filters(
         outline_color_hex = t.get("outlineColor", "#000000")
         border_part = ""
         if outline_width > 0:
-            # Scale outline width proporsional terhadap lebar video
             outline_ratio = outline_width / FONT_REFERENCE_WIDTH
             border_color = hex_to_ffmpeg_color(outline_color_hex, 1.0)
             border_part = f"borderw=w*{outline_ratio:.6f}:bordercolor={border_color}:"
@@ -681,7 +653,6 @@ def build_ffmpeg_filters(
         if shadow_enabled:
             shadow_color_hex = t.get("shadowColor", "#000000")
             shadow_color     = hex_to_ffmpeg_color(shadow_color_hex, 0.85)
-            # Scale shadow offset proporsional
             sx = float(t.get("shadowX", 2)) / FONT_REFERENCE_WIDTH * 1080
             sy = float(t.get("shadowY", 2)) / FONT_REFERENCE_WIDTH * 1080
             shadow_part = f"shadowcolor={shadow_color}:shadowx={sx:.1f}:shadowy={sy:.1f}:"
@@ -716,6 +687,44 @@ def build_ffmpeg_filters(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# YOUTUBE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sanitize_filename(title: str) -> str:
+    """Remove characters unsafe for filenames."""
+    safe = re.sub(r'[\\/*?:"<>|]', "", title)
+    safe = re.sub(r'\s+', "_", safe.strip())
+    return safe[:80] or "youtube_video"
+
+
+def _pick_best_stream(yt: "YouTube", max_resolution: int = 720):
+    """
+    Pick best progressive (video+audio) mp4 stream ≤ max_resolution.
+    Falls back to any mp4 if no progressive stream found.
+    """
+    progressive = (
+        yt.streams
+        .filter(progressive=True, file_extension="mp4")
+        .order_by("resolution")
+    )
+
+    chosen = None
+    for stream in reversed(list(progressive)):
+        try:
+            res = int((stream.resolution or "0p").replace("p", ""))
+        except ValueError:
+            continue
+        if res <= max_resolution:
+            chosen = stream
+            break
+
+    if not chosen:
+        chosen = progressive.last()
+
+    return chosen
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -729,15 +738,16 @@ async def health():
     }.get(provider, provider)
 
     return {
-        "ok":          True,
-        "ffmpeg":      FFMPEG_BIN,
-        "drawtext":    DRAWTEXT_OK,
-        "font":        SYSTEM_FONT,
+        "ok":           True,
+        "ffmpeg":       FFMPEG_BIN,
+        "drawtext":     DRAWTEXT_OK,
+        "font":         SYSTEM_FONT,
         "stt_provider": provider,
-        "stt_detail":  stt_detail,
-        "mode":        "stream-only",
-        "tmpDir":      str(TEMP_DIR),
-        "ai_models":   AI_MODELS,
+        "stt_detail":   stt_detail,
+        "youtube":      PYTUBEFIX_OK,
+        "mode":         "stream-only",
+        "tmpDir":       str(TEMP_DIR),
+        "ai_models":    AI_MODELS,
     }
 
 
@@ -752,6 +762,167 @@ async def test_font(
         size = Path(path).stat().st_size
         return {"ok": True, "family": family, "path": path, "size_bytes": size}
     return {"ok": False, "family": family, "path": path}
+
+
+# ─── GET /api/youtube-info ────────────────────────────────────────────────────
+@app.get("/api/youtube-info")
+async def youtube_info(url: str):
+    """
+    Return metadata for a YouTube URL without downloading.
+    Used by the frontend to show a preview card before the user confirms download.
+    """
+    if not PYTUBEFIX_OK:
+        raise HTTPException(501, "pytubefix not installed on server. Add 'pytubefix' to requirements.txt")
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _fetch():
+            yt = YouTube(url)
+            # Access attributes to force metadata load
+            title     = yt.title
+            length    = yt.length
+            thumbnail = yt.thumbnail_url
+            author    = yt.author
+
+            streams_info = []
+            for s in yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution"):
+                try:
+                    size_mb = round((s.filesize or 0) / 1_048_576, 1)
+                except Exception:
+                    size_mb = 0
+                streams_info.append({
+                    "resolution": s.resolution,
+                    "filesize_mb": size_mb,
+                    "itag": s.itag,
+                })
+
+            return {
+                "title":     title,
+                "duration":  length,
+                "thumbnail": thumbnail,
+                "author":    author,
+                "streams":   streams_info,
+            }
+
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, _fetch),
+            timeout=30.0
+        )
+        return result
+
+    except asyncio.TimeoutError:
+        raise HTTPException(408, "YouTube request timed out — try again")
+    except Exception as e:
+        msg = str(e)
+        print(f"[youtube-info error] {msg}")
+        if "regex" in msg.lower() or "VideoUnavailable" in msg:
+            raise HTTPException(404, "Video tidak ditemukan atau tidak tersedia")
+        if "private" in msg.lower():
+            raise HTTPException(403, "Video ini bersifat privat")
+        if "age" in msg.lower():
+            raise HTTPException(403, "Video ini memerlukan verifikasi usia")
+        raise HTTPException(400, f"Gagal mengambil info video: {msg[:200]}")
+
+
+# ─── POST /api/download-youtube ──────────────────────────────────────────────
+@app.post("/api/download-youtube")
+async def download_youtube(
+    url:            str = Form(...),
+    max_resolution: int = Form(default=720),
+):
+    """
+    Download a YouTube video and stream it back to the client.
+    The client stores the blob in IndexedDB — identical flow to file upload.
+    """
+    if not PYTUBEFIX_OK:
+        raise HTTPException(501, "pytubefix not installed on server. Add 'pytubefix' to requirements.txt")
+
+    tmp_path: Optional[Path] = None
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        # ── Resolve metadata + pick stream (blocking, run in executor) ────────
+        def _prepare():
+            yt     = YouTube(url)
+            title  = yt.title or "youtube_video"
+            length = yt.length or 0
+            stream = _pick_best_stream(yt, max_resolution)
+            return yt, title, length, stream
+
+        yt, title, length, stream = await asyncio.wait_for(
+            loop.run_in_executor(None, _prepare),
+            timeout=30.0
+        )
+
+        if not stream:
+            raise HTTPException(404, "Tidak ada stream yang bisa diunduh untuk video ini")
+
+        safe_title = _sanitize_filename(title)
+        filename   = f"{safe_title}.mp4"
+        tmp_name   = f"yt_{os.urandom(8).hex()}.mp4"
+        tmp_path   = TEMP_DIR / tmp_name
+
+        print(f"📺 YouTube download: '{title}' res={stream.resolution} → {tmp_path.name}")
+
+        # ── Download file to temp dir (blocking) ──────────────────────────────
+        def _download():
+            stream.download(output_path=str(TEMP_DIR), filename=tmp_name)
+
+        await asyncio.wait_for(
+            loop.run_in_executor(None, _download),
+            timeout=600.0   # 10 min max for large videos
+        )
+
+        if not tmp_path.exists() or tmp_path.stat().st_size < 1_000:
+            raise HTTPException(500, "Download gagal — file kosong atau tidak lengkap")
+
+        file_size = tmp_path.stat().st_size
+        print(f"✅ Downloaded {file_size:,} bytes ({stream.resolution})")
+
+        # ── Stream back to client ─────────────────────────────────────────────
+        def _iterfile():
+            try:
+                with open(tmp_path, "rb") as fh:
+                    while chunk := fh.read(65_536):
+                        yield chunk
+            finally:
+                safe_delete(tmp_path)
+
+        # Sanitize header values (no non-ASCII)
+        safe_header_title = title.encode("ascii", errors="replace").decode("ascii")
+
+        return StreamingResponse(
+            _iterfile(),
+            media_type="video/mp4",
+            headers={
+                "X-File-Name":      filename,
+                "X-Video-Title":    safe_header_title,
+                "X-Video-Duration": str(length),
+                "Content-Length":   str(file_size),
+                "Access-Control-Expose-Headers":
+                    "X-File-Name,X-Video-Title,X-Video-Duration,Content-Length",
+            },
+        )
+
+    except HTTPException:
+        safe_delete(tmp_path)
+        raise
+    except asyncio.TimeoutError:
+        safe_delete(tmp_path)
+        raise HTTPException(408, "Download YouTube timed out. Coba video yang lebih pendek.")
+    except Exception as e:
+        safe_delete(tmp_path)
+        msg = str(e)
+        print(f"[youtube-download error] {msg}")
+        if "private" in msg.lower():
+            raise HTTPException(403, "Video ini bersifat privat")
+        if "age" in msg.lower():
+            raise HTTPException(403, "Video ini memerlukan verifikasi usia")
+        if "unavailable" in msg.lower() or "regex" in msg.lower():
+            raise HTTPException(404, "Video tidak ditemukan atau tidak tersedia")
+        raise HTTPException(400, f"Download gagal: {msg[:200]}")
 
 
 # ─── POST /api/get-video-duration ─────────────────────────────────────────────
