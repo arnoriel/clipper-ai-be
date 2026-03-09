@@ -369,7 +369,6 @@ def call_whisper_local(audio_path: Path, language: Optional[str] = None) -> dict
     try:
         from faster_whisper import WhisperModel  # type: ignore
     except ImportError:
-        # RuntimeError (not HTTPException) because this runs in a thread executor
         raise RuntimeError(
             "faster-whisper not installed. Run: pip install faster-whisper"
         )
@@ -417,7 +416,6 @@ async def call_whisper_api(audio_path: Path, language: Optional[str] = None) -> 
     elif provider == "openai":
         return await call_whisper_openai(audio_path, language)
     else:
-        # Run local model in thread pool so it doesn't block the event loop
         loop = asyncio.get_event_loop()
         try:
             return await loop.run_in_executor(
@@ -565,6 +563,10 @@ def escape_drawtext(text: str) -> str:
     return text
 
 
+# ── Font reference width: font size disimpan sbg "px di 1080px lebar" ─────────
+FONT_REFERENCE_WIDTH = 1080.0
+
+
 def build_ffmpeg_filters(
     edits: dict,
     resolved_fonts: Optional[dict[str, Optional[str]]] = None,
@@ -624,7 +626,12 @@ def build_ffmpeg_filters(
         else:
             font_part = ""
 
-        font_size = t.get("fontSize", 36)
+        # ── Font size: disimpan sebagai px di referensi 1080px lebar.
+        # Pakai ekspresi ffmpeg `w * ratio` supaya otomatis scale ke
+        # resolusi output setelah crop (9:16, 1:1, dll).
+        font_size_stored = float(t.get("fontSize", 36))
+        font_size_ratio  = font_size_stored / FONT_REFERENCE_WIDTH
+        font_size_expr   = f"w*{font_size_ratio:.6f}"
 
         opacity       = float(t.get("opacity", 1.0))
         font_color_hex = t.get("color", "#FFFFFF")
@@ -664,17 +671,20 @@ def build_ffmpeg_filters(
         outline_color_hex = t.get("outlineColor", "#000000")
         border_part = ""
         if outline_width > 0:
+            # Scale outline width proporsional terhadap lebar video
+            outline_ratio = outline_width / FONT_REFERENCE_WIDTH
             border_color = hex_to_ffmpeg_color(outline_color_hex, 1.0)
-            border_part = f"borderw={outline_width:.1f}:bordercolor={border_color}:"
+            border_part = f"borderw=w*{outline_ratio:.6f}:bordercolor={border_color}:"
 
         shadow_enabled = t.get("shadowEnabled", True)
         shadow_part = ""
         if shadow_enabled:
             shadow_color_hex = t.get("shadowColor", "#000000")
             shadow_color     = hex_to_ffmpeg_color(shadow_color_hex, 0.85)
-            sx = float(t.get("shadowX", 2))
-            sy = float(t.get("shadowY", 2))
-            shadow_part = f"shadowcolor={shadow_color}:shadowx={sx:.0f}:shadowy={sy:.0f}:"
+            # Scale shadow offset proporsional
+            sx = float(t.get("shadowX", 2)) / FONT_REFERENCE_WIDTH * 1080
+            sy = float(t.get("shadowY", 2)) / FONT_REFERENCE_WIDTH * 1080
+            shadow_part = f"shadowcolor={shadow_color}:shadowx={sx:.1f}:shadowy={sy:.1f}:"
         else:
             shadow_part = "shadowcolor=0x00000000:shadowx=0:shadowy=0:"
 
@@ -691,7 +701,7 @@ def build_ffmpeg_filters(
             f"drawtext="
             f"{font_part}"
             f"text='{safe_text}':"
-            f"fontsize={font_size}:"
+            f"fontsize={font_size_expr}:"
             f"fontcolor={font_color}:"
             f"{shadow_part}"
             f"{border_part}"
@@ -880,15 +890,6 @@ async def auto_subtitle(
     words_per_chunk: int   = Form(default=3),
     language:   str        = Form(default=""),
 ):
-    """
-    Transcribe a video clip using OpenAI Whisper and return
-    subtitle chunks (N words each) with start/end timestamps
-    relative to clip start.
-
-    Requires OPENAI_API_KEY environment variable.
-    """
-    api_key_available = bool(GROQ_API_KEY or OPENAI_API_KEY)
-    # local faster-whisper also works without any key
     provider, _ = _whisper_available_provider()
 
     duration = end_time - start_time
@@ -900,29 +901,25 @@ async def auto_subtitle(
     audio_path  = TEMP_DIR / f"asr_{os.urandom(8).hex()}.mp3"
 
     try:
-        # 1. Save uploaded video
         with upload_path.open("wb") as f:
             shutil.copyfileobj(video.file, f)
 
         print(f"🎙️  Auto-subtitle: provider={provider} start={start_time:.1f}s dur={duration:.1f}s words_per_chunk={words_per_chunk}")
 
-        # 2. Extract audio segment
         ok = await extract_audio_segment(upload_path, start_time, duration, audio_path)
         if not ok:
             raise HTTPException(500, "Failed to extract audio from video")
 
-        # 3. Call Whisper
         result = await call_whisper_api(audio_path, language=language or None)
         words  = result.get("words", [])
 
         print(f"   ✅ Transcribed {len(words)} words")
 
-        # 4. Group into N-word chunks
         chunks = group_words_to_subtitles(words, words_per_chunk=words_per_chunk)
 
         return {
             "ok":       True,
-            "chunks":   chunks,          # [{ text, start, end }] relative to clip start=0
+            "chunks":   chunks,
             "language": result.get("language", ""),
             "full_text": result.get("text", ""),
             "word_count": len(words),
