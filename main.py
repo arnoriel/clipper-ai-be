@@ -7,6 +7,7 @@ Deploy: Railway / Render (free tier)
 import os
 import re
 import json
+import base64 as b64
 import asyncio
 import tempfile
 import subprocess
@@ -27,7 +28,7 @@ from fastapi.responses import StreamingResponse
 import shutil
 
 # ─── App ──────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AI Viral Clipper Backend", version="3.0.0")
+app = FastAPI(title="AI Viral Clipper Backend", version="3.1.0")
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
@@ -247,6 +248,48 @@ async def resolve_fonts_for_overlays(overlays: list[dict]) -> dict[str, Optional
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# IMAGE OVERLAY — base64 decode + save to temp
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_image_overlay_to_temp(img_data_url: str, idx: int) -> Optional[Path]:
+    """
+    Decode a base64 data URL (e.g. "data:image/png;base64,iVBOR…")
+    and write it to a temp file.  Returns the Path or None on failure.
+    """
+    try:
+        if not img_data_url or "," not in img_data_url:
+            return None
+
+        header, data = img_data_url.split(",", 1)
+        header_lower = header.lower()
+
+        # Detect extension from MIME type in header
+        ext = ".png"
+        if "jpeg" in header_lower or "jpg" in header_lower:
+            ext = ".jpg"
+        elif "webp" in header_lower:
+            ext = ".webp"
+        elif "gif" in header_lower:
+            ext = ".gif"
+        elif "svg" in header_lower:
+            ext = ".svg"
+
+        img_bytes = b64.b64decode(data)
+        if len(img_bytes) < 16:
+            print(f"⚠️  Image overlay {idx}: decoded bytes too small, skipping")
+            return None
+
+        path = TEMP_DIR / f"imgoverlay_{idx}_{os.urandom(4).hex()}{ext}"
+        path.write_bytes(img_bytes)
+        print(f"🖼️  Image overlay {idx} saved: {path.name} ({len(img_bytes):,} bytes)")
+        return path
+
+    except Exception as e:
+        print(f"❌ Image overlay {idx} decode error: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # WHISPER AUTO-SUBTITLE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -262,10 +305,10 @@ async def extract_audio_segment(
         "-ss", str(start_sec),
         "-i", str(video_path),
         "-t", str(duration_sec),
-        "-vn",                          # no video
+        "-vn",
         "-acodec", "libmp3lame",
         "-ab", "128k",
-        "-ar", "16000",                 # Whisper prefers 16kHz
+        "-ar", "16000",
         str(output_path),
     ]
     proc = subprocess.run(cmd, capture_output=True, timeout=120)
@@ -273,10 +316,6 @@ async def extract_audio_segment(
 
 
 def _whisper_available_provider() -> tuple[str, str]:
-    """
-    Return (provider_name, api_key) for the first available STT provider.
-    Priority: Groq (FREE) → OpenAI → local faster-whisper (no key needed)
-    """
     if GROQ_API_KEY:
         return ("groq", GROQ_API_KEY)
     if OPENAI_API_KEY:
@@ -285,11 +324,6 @@ def _whisper_available_provider() -> tuple[str, str]:
 
 
 async def call_whisper_groq(audio_path: Path, language: Optional[str] = None) -> dict:
-    """
-    Groq Whisper — FREE tier, very fast, word timestamps.
-    Endpoint mirrors OpenAI's audio/transcriptions API.
-    Model: whisper-large-v3-turbo (fastest) or whisper-large-v3
-    """
     endpoint = "https://api.groq.com/openai/v1/audio/transcriptions"
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
@@ -297,7 +331,7 @@ async def call_whisper_groq(audio_path: Path, language: Optional[str] = None) ->
             audio_bytes = f.read()
 
         data = {
-            "model":             "whisper-large-v3-turbo",  # Free on Groq
+            "model":             "whisper-large-v3-turbo",
             "response_format":   "verbose_json",
             "timestamp_granularities[]": "word",
         }
@@ -317,10 +351,8 @@ async def call_whisper_groq(audio_path: Path, language: Optional[str] = None) ->
             raise HTTPException(502, f"Groq Whisper error {resp.status_code}: {resp.text[:300]}")
 
         result = resp.json()
-        # Groq returns words inside segments; flatten if needed
         words = result.get("words", [])
         if not words:
-            # Try extracting from segments
             for seg in result.get("segments", []):
                 for w in seg.get("words", []):
                     words.append(w)
@@ -330,7 +362,6 @@ async def call_whisper_groq(audio_path: Path, language: Optional[str] = None) ->
 
 
 async def call_whisper_openai(audio_path: Path, language: Optional[str] = None) -> dict:
-    """OpenAI Whisper API — requires paid credits."""
     endpoint = "https://api.openai.com/v1/audio/transcriptions"
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
@@ -361,11 +392,6 @@ async def call_whisper_openai(audio_path: Path, language: Optional[str] = None) 
 
 
 def call_whisper_local(audio_path: Path, language: Optional[str] = None) -> dict:
-    """
-    Local faster-whisper transcription — no API key needed, runs on CPU.
-    Install: pip install faster-whisper
-    Downloads model on first run (~150 MB for 'base').
-    """
     try:
         from faster_whisper import WhisperModel  # type: ignore
     except ImportError:
@@ -402,12 +428,6 @@ def call_whisper_local(audio_path: Path, language: Optional[str] = None) -> dict
 
 
 async def call_whisper_api(audio_path: Path, language: Optional[str] = None) -> dict:
-    """
-    Auto-select STT provider:
-      1. Groq  (GROQ_API_KEY)    — FREE, recommended
-      2. OpenAI (OPENAI_API_KEY) — paid
-      3. local faster-whisper    — no key needed, slower
-    """
     provider, _ = _whisper_available_provider()
     print(f"🎙️  STT provider: {provider}")
 
@@ -429,11 +449,6 @@ def group_words_to_subtitles(
     words: list[dict],
     words_per_chunk: int = 3,
 ) -> list[dict]:
-    """
-    Group word-level timestamps into N-word subtitle chunks.
-    Each word dict has keys: word, start, end.
-    Returns list of { text, start, end }.
-    """
     subtitles = []
     for i in range(0, len(words), words_per_chunk):
         chunk = words[i : i + words_per_chunk]
@@ -580,6 +595,11 @@ def build_ffmpeg_filters(
         crop_w = f"if(gt(iw/ih\\,{rw}/{rh})\\,trunc(ih*{rw}/{rh}/2)*2\\,iw)"
         crop_h = f"if(gt(iw/ih\\,{rw}/{rh})\\,ih\\,trunc(iw*{rh}/{rw}/2)*2)"
         filters.append(f"crop={crop_w}:{crop_h}:(iw-out_w)/2:(ih-out_h)/2")
+        # ── FIX: force 1:1 SAR after crop ────────────────────────────────────
+        # Without this, some source videos with non-square SAR (e.g. anamorphic)
+        # cause ffmpeg to apply display-aspect-ratio scaling to the output,
+        # stretching the final video. setsar=1:1 locks pixels to square.
+        filters.append("setsar=1:1")
 
     # ── Color eq ─────────────────────────────────────────────────────────────
     eq_parts   = []
@@ -626,9 +646,6 @@ def build_ffmpeg_filters(
         else:
             font_part = ""
 
-        # ── Font size: disimpan sebagai px di referensi 1080px lebar.
-        # Pakai ekspresi ffmpeg `w * ratio` supaya otomatis scale ke
-        # resolusi output setelah crop (9:16, 1:1, dll).
         font_size_stored = float(t.get("fontSize", 36))
         font_size_ratio  = font_size_stored / FONT_REFERENCE_WIDTH
         font_size_expr   = f"w*{font_size_ratio:.6f}"
@@ -671,7 +688,6 @@ def build_ffmpeg_filters(
         outline_color_hex = t.get("outlineColor", "#000000")
         border_part = ""
         if outline_width > 0:
-            # Scale outline width proporsional terhadap lebar video
             outline_ratio = outline_width / FONT_REFERENCE_WIDTH
             border_color = hex_to_ffmpeg_color(outline_color_hex, 1.0)
             border_part = f"borderw=w*{outline_ratio:.6f}:bordercolor={border_color}:"
@@ -681,7 +697,6 @@ def build_ffmpeg_filters(
         if shadow_enabled:
             shadow_color_hex = t.get("shadowColor", "#000000")
             shadow_color     = hex_to_ffmpeg_color(shadow_color_hex, 0.85)
-            # Scale shadow offset proporsional
             sx = float(t.get("shadowX", 2)) / FONT_REFERENCE_WIDTH * 1080
             sy = float(t.get("shadowY", 2)) / FONT_REFERENCE_WIDTH * 1080
             shadow_part = f"shadowcolor={shadow_color}:shadowx={sx:.1f}:shadowy={sy:.1f}:"
@@ -713,6 +728,114 @@ def build_ffmpeg_filters(
         filters.append(drawtext)
 
     return filters
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMAGE OVERLAY — filter_complex builder
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_filter_complex_with_images(
+    base_filters: list[str],
+    image_overlays: list[dict],
+    img_paths: list[Path],
+) -> tuple[str, str]:
+    """
+    Build a -filter_complex string that:
+      1. Applies base video filters (crop, setsar, eq, setpts, drawtext) to [0:v]
+      2. Chains each image overlay on top using split + scale + overlay
+
+    image_overlays and img_paths must be the same length (pre-validated).
+
+    Returns:
+      filter_complex_str  – full string for -filter_complex flag
+      final_label         – the output label to pass to -map
+    """
+    parts: list[str] = []
+
+    # ── Step 1: apply base video filters ─────────────────────────────────────
+    if base_filters:
+        parts.append(f"[0:v]{','.join(base_filters)}[vbase0]")
+    else:
+        # Simple passthrough — null filter keeps the stream clean
+        parts.append("[0:v]null[vbase0]")
+
+    current = "vbase0"
+
+    # ── Step 2: chain each image overlay ─────────────────────────────────────
+    for i, (img, img_path) in enumerate(zip(image_overlays, img_paths)):
+        # video = input 0 ; images = inputs 1, 2, 3 …
+        input_idx = i + 1
+
+        width_ratio = max(0.01, min(1.0, float(img.get("width", 0.25))))
+        opacity     = max(0.0,  min(1.0, float(img.get("opacity", 1.0))))
+        x_pct       = float(img.get("x", 0.5))
+        y_pct       = float(img.get("y", 0.1))
+        start_sec   = img.get("startSec")
+        end_sec     = img.get("endSec")
+
+        raw_label   = f"imgraw{i}"
+        alpha_label = f"imgalpha{i}"
+        # Two split outputs: one for scale reference, one for overlay base
+        vref_label  = f"vref{i}"
+        vbase_label = f"vbase_ov{i}"
+        next_base   = f"vbase{i + 1}"
+
+        # ── 2a. Split the current video stream into two ───────────────────────
+        #
+        # WHY: The modern `scale` filter (replacing deprecated scale2ref) takes
+        # the video as its SECOND input to obtain reference dimensions via `rw`/`rh`.
+        # However, `scale` CONSUMES its reference input — it does not pass it
+        # through. So we must split the video: one copy goes to `scale` as the
+        # reference (consumed), the other goes directly to `overlay` as the base.
+        #
+        parts.append(f"[{current}]split[{vref_label}][{vbase_label}]")
+
+        # ── 2b. Scale image to (video_width × width_ratio) ───────────────────
+        #
+        # FILTER HISTORY:
+        #   scale2ref was deprecated in newer ffmpeg builds. Its replacement is
+        #   `scale=w=rw*ratio:h=-1` where `rw`/`rh` are the reference stream's
+        #   dimensions (available when a second input is provided to scale).
+        #
+        #   The syntax `[image][video_ref]scale=w=rw*ratio:h=-1[scaled_image]`
+        #   outputs ONLY the scaled image — reference is consumed, not passed through.
+        #   That is why the split in step 2a is required.
+        #
+        parts.append(
+            f"[{input_idx}:v][{vref_label}]"
+            f"scale=w=rw*{width_ratio:.4f}:h=-1"
+            f"[{raw_label}]"
+        )
+
+        # ── 2c. Force RGBA and apply opacity ──────────────────────────────────
+        parts.append(
+            f"[{raw_label}]format=rgba,"
+            f"colorchannelmixer=aa={opacity:.3f}"
+            f"[{alpha_label}]"
+        )
+
+        # ── 2d. Overlay: center anchor at (x%, y%) of the video ──────────────
+        # W/H here refer to the base (video) stream dimensions in overlay context.
+        x_expr = f"W*{x_pct:.4f}-w/2"
+        y_expr = f"H*{y_pct:.4f}-h/2"
+
+        enable_part = ""
+        if start_sec is not None and end_sec is not None:
+            enable_part = (
+                f":enable='between(t,"
+                f"{float(start_sec):.3f},"
+                f"{float(end_sec):.3f})'"
+            )
+
+        parts.append(
+            f"[{vbase_label}][{alpha_label}]"
+            f"overlay=x={x_expr}:y={y_expr}{enable_part}"
+            f"[{next_base}]"
+        )
+
+        current = next_base
+
+    return ";".join(parts), current
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -940,6 +1063,8 @@ async def export_clip(
     suffix      = Path(video.filename or "source.mp4").suffix or ".mp4"
     upload_path = TEMP_DIR / f"upload_{os.urandom(8).hex()}{suffix}"
 
+    img_temp_files: list[Path] = []
+
     try:
         with upload_path.open("wb") as f:
             shutil.copyfileobj(video.file, f)
@@ -951,36 +1076,122 @@ async def export_clip(
         duration_sec = float(clip["endTime"]) - start_sec
         speed        = float(edits.get("speed", 1))
 
-        text_overlays = edits.get("textOverlays", [])
-        resolved_fonts: dict[str, Optional[str]] = {}
+        text_overlays  = edits.get("textOverlays", [])
+        image_overlays = edits.get("imageOverlays", [])
 
+        # ── Resolve fonts ─────────────────────────────────────────────────────
+        resolved_fonts: dict[str, Optional[str]] = {}
         if DRAWTEXT_OK and text_overlays:
-            print(f"🔤 Resolving fonts for {len(text_overlays)} overlays…")
+            print(f"🔤 Resolving fonts for {len(text_overlays)} text overlays…")
             resolved_fonts = await resolve_fonts_for_overlays(text_overlays)
 
-        filters      = build_ffmpeg_filters(edits, resolved_fonts=resolved_fonts)
-        has_overlays = DRAWTEXT_OK and len(text_overlays) > 0
+        # ── Decode image overlays to temp files ───────────────────────────────
+        valid_image_overlays: list[dict] = []
+        for i, img in enumerate(image_overlays):
+            src = img.get("src", "")
+            if not src:
+                continue
+            path = save_image_overlay_to_temp(src, i)
+            if path:
+                img_temp_files.append(path)
+                valid_image_overlays.append(img)
+
+        has_text_overlays  = DRAWTEXT_OK and bool(text_overlays)
+        has_image_overlays = bool(valid_image_overlays)
+
+        # ── Base video filters (crop / setsar / eq / speed / drawtext) ────────
+        base_filters = build_ffmpeg_filters(edits, resolved_fonts)
+
+        print(
+            f"🎬 Export start={start_sec:.1f}s dur={duration_sec:.1f}s "
+            f"text={len(text_overlays)} images={len(valid_image_overlays)}"
+        )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # Build ffmpeg command
+        #
+        # BUG FIX — 145MB file size (full video exported instead of clip):
+        #
+        #   Root cause: ffmpeg option scope depends on position relative to -i.
+        #   An option placed BEFORE -i is an INPUT option (applies to that input).
+        #   An option placed AFTER all -i flags is an OUTPUT option.
+        #
+        #   OLD (broken):
+        #     ffmpeg -ss {start} -i video.mp4 -t {dur}   ← -t after first -i
+        #            -loop 1 -i img.png                  ← second -i added
+        #     Result: -t between two -i flags → ffmpeg treats it as INPUT option
+        #             for the NEXT input (img.png), NOT as output duration.
+        #             Video has no duration limit → encodes full 13:41 source.
+        #
+        #   NEW (correct):
+        #     ffmpeg -ss {start} -t {dur} -i video.mp4   ← -t BEFORE -i (input opt)
+        #            -loop 1 -t {dur} -i img.png          ← -t before each image too
+        #            [filters...]
+        #            -t {dur}                             ← output option (hard cap)
+        #
+        #   Triple belt-and-suspenders:
+        #     1. -t before -i video   → limits how much of the source is read
+        #     2. -t before -i img     → limits image loop duration
+        #     3. -t after all inputs  → hard output duration cap regardless of filters
+        # ══════════════════════════════════════════════════════════════════════
 
         args = [
             FFMPEG_BIN, "-y",
-            "-ss", seconds_to_ffmpeg(start_sec),
+            # ── Input options for main video (ALL before -i) ──────────────────
+            "-ss", seconds_to_ffmpeg(start_sec),     # fast keyframe seek
+            "-t",  seconds_to_ffmpeg(duration_sec),  # FIX: limit read to clip length
             "-i",  str(upload_path),
-            "-t",  seconds_to_ffmpeg(duration_sec),
         ]
-        if filters:
-            args += ["-vf", ",".join(filters)]
-        if speed != 1:
-            args += ["-af", f"atempo={max(0.5, min(2.0, speed))}"]
+
+        if has_image_overlays:
+            # Each image needs its own -t INPUT option before -loop 1 -i img
+            for img_path in img_temp_files:
+                args += [
+                    "-loop", "1",
+                    "-t",   seconds_to_ffmpeg(duration_sec),  # FIX: limit loop duration
+                    "-i",   str(img_path),
+                ]
+
+            filter_complex, final_label = build_filter_complex_with_images(
+                base_filters,
+                valid_image_overlays,
+                img_temp_files,
+            )
+
+            args += [
+                "-filter_complex", filter_complex,
+                "-map", f"[{final_label}]",
+                "-map", "0:a?",   # optional audio from main video
+            ]
+
+            if speed != 1:
+                args += ["-af", f"atempo={max(0.5, min(2.0, speed))}"]
+
+            # Hard output duration cap — runs after all filters
+            args += ["-t", seconds_to_ffmpeg(duration_sec)]
+
+        else:
+            # Simple -vf path (no image overlays)
+            # -t is already set as input option above (before -i video)
+            if base_filters:
+                args += ["-vf", ",".join(base_filters)]
+            if speed != 1:
+                args += ["-af", f"atempo={max(0.5, min(2.0, speed))}"]
+
+        # ── Encoder settings ──────────────────────────────────────────────────
+        # veryfast preset: ~40% smaller than ultrafast, minimal extra CPU time
         args += [
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k",
             "-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "pipe:1",
         ]
 
-        print(f"🎬 Export start={start_sec:.1f}s dur={duration_sec:.1f}s overlays={len(text_overlays)}")
+        # ── Execute ffmpeg ────────────────────────────────────────────────────
+        use_buffered = has_image_overlays or has_text_overlays
+        file_name    = f"clip_{int(start_sec)}_{int(start_sec + duration_sec)}.mp4"
 
-        if has_overlays:
+        if use_buffered:
             process = await asyncio.create_subprocess_exec(
                 *args,
                 stdout=asyncio.subprocess.PIPE,
@@ -988,20 +1199,29 @@ async def export_clip(
             )
             stdout_data, stderr_data = await process.communicate()
 
+            for p in img_temp_files:
+                safe_delete(p)
+            img_temp_files.clear()
+
             if process.returncode != 0 or len(stdout_data) == 0:
                 err = stderr_data.decode("utf-8", errors="replace")
                 print(f"[ffmpeg error]\n{err[-800:]}")
                 safe_delete(upload_path)
+
                 hint = ""
                 if "No such file or directory" in err and "font" in err.lower():
                     hint = " (font file not found)"
                 elif "drawtext" in err.lower():
                     hint = " (drawtext filter error)"
+                elif "scale2ref" in err.lower() or "overlay" in err.lower():
+                    hint = " (image overlay filter error)"
                 raise HTTPException(500, f"ffmpeg failed{hint}: {err[-300:]}")
 
             safe_delete(upload_path)
-            print(f"✅ Export OK — {len(stdout_data):,} bytes (buffered)")
-            file_name = f"clip_{int(start_sec)}_{int(start_sec + duration_sec)}.mp4"
+            print(
+                f"✅ Export OK — {len(stdout_data):,} bytes "
+                f"(buffered, images={len(valid_image_overlays)}, dur={duration_sec:.1f}s)"
+            )
 
             async def yield_buffer():
                 yield stdout_data
@@ -1017,6 +1237,7 @@ async def export_clip(
             )
 
         else:
+            # Pure streaming — no overlays at all
             process = await asyncio.create_subprocess_exec(
                 *args,
                 stdout=asyncio.subprocess.PIPE,
@@ -1031,7 +1252,6 @@ async def export_clip(
                     stderr_buf.append(chunk)
 
             stderr_task = asyncio.ensure_future(drain_stderr())
-            file_name   = f"clip_{int(start_sec)}_{int(start_sec + duration_sec)}.mp4"
 
             async def stream_stdout():
                 total = 0
@@ -1042,9 +1262,12 @@ async def export_clip(
                     await process.wait()
                     await stderr_task
                     if process.returncode != 0:
-                        print(f"[ffmpeg error]\n{b''.join(stderr_buf).decode(errors='replace')[-500:]}")
+                        print(
+                            f"[ffmpeg error]\n"
+                            f"{b''.join(stderr_buf).decode(errors='replace')[-500:]}"
+                        )
                     else:
-                        print(f"✅ Export OK — {total:,} bytes (streaming)")
+                        print(f"✅ Export OK — {total:,} bytes (streaming, dur={duration_sec:.1f}s)")
                 finally:
                     safe_delete(upload_path)
                     if process.returncode is None:
@@ -1062,9 +1285,13 @@ async def export_clip(
 
     except HTTPException:
         safe_delete(upload_path)
+        for p in img_temp_files:
+            safe_delete(p)
         raise
     except Exception as e:
         safe_delete(upload_path)
+        for p in img_temp_files:
+            safe_delete(p)
         print(f"[export exception] {e}")
         raise HTTPException(500, f"Export failed: {str(e)}")
 
