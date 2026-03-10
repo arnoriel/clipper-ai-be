@@ -11,6 +11,7 @@ import base64 as b64
 import asyncio
 import tempfile
 import subprocess
+import yt_dlp
 from pathlib import Path
 from typing import Optional
 
@@ -1294,6 +1295,101 @@ async def export_clip(
             safe_delete(p)
         print(f"[export exception] {e}")
         raise HTTPException(500, f"Export failed: {str(e)}")
+
+
+# ─── GET /api/youtube-info ────────────────────────────────────────────────────
+@app.get("/api/youtube-info")
+async def get_youtube_info(url: str):
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                raise HTTPException(400, "Could not extract video info")
+            
+            # Use 'duration' if available, otherwise 0
+            duration = info.get("duration") or 0
+            
+            return {
+                "ok": True,
+                "title": info.get("title", "YouTube Video"),
+                "duration": duration,
+                "thumbnail": info.get("thumbnail")
+            }
+    except Exception as e:
+        print(f"[youtube info error] {e}")
+        raise HTTPException(400, f"Gagal mengambil info YouTube: {str(e)}")
+
+
+# ─── POST /api/download-youtube ───────────────────────────────────────────────
+@app.post("/api/download-youtube")
+async def download_youtube(url: str = Form(...)):
+    # 1. First get info to find the best suitable format and extension
+    ydl_opts_info = {
+        'quiet': True,
+        'no_warnings': True,
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get("title", "youtube_video")
+            # Clean title for filename safely
+            clean_title = re.sub(r'[\/\\\:\*\?\"\<\>\|]', '', title).replace(' ', '_')
+            filename = f"{clean_title}.mp4"
+            
+            # Use format up to 1080p to avoid huge files and ensure fast download
+            format_selector = 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+            
+            # Setup a temporary path to download to
+            tmp_dir = TEMP_DIR / "yt_downloads"
+            tmp_dir.mkdir(exist_ok=True)
+            dl_path = tmp_dir / f"{os.urandom(8).hex()}.mp4"
+            
+            ydl_opts_dl = {
+                'format': format_selector,
+                'outtmpl': str(dl_path),
+                'quiet': True,
+                'no_warnings': True,
+                # merge video and audio
+                'merge_output_format': 'mp4',
+            }
+            
+            print(f"Downloading YouTube video: {url}")
+            # Run download
+            with yt_dlp.YoutubeDL(ydl_opts_dl) as ydl_dl:
+                ydl_dl.download([url])
+                
+            if not dl_path.exists():
+                raise Exception("Download completed but file not found")
+                
+            file_size = dl_path.stat().st_size
+            
+            def file_iterator():
+                try:
+                    with open(dl_path, "rb") as f:
+                        while chunk := f.read(65536):
+                            yield chunk
+                finally:
+                    safe_delete(dl_path)
+            
+            return StreamingResponse(
+                file_iterator(),
+                media_type="video/mp4",
+                headers={
+                    "X-File-Name": filename,
+                    "Access-Control-Expose-Headers": "X-File-Name",
+                    "Content-Length": str(file_size),
+                }
+            )
+            
+    except Exception as e:
+        print(f"[youtube download error] {e}")
+        raise HTTPException(500, f"Gagal memproses video YouTube: {str(e)}")
 
 
 # ─── Run (dev) ────────────────────────────────────────────────────────────────
