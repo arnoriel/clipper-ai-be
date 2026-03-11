@@ -8,11 +8,14 @@ import os
 import re
 import json
 import base64 as b64
+import base64 as b64
 import asyncio
 import tempfile
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 # Load .env file (untuk development lokal)
 try:
@@ -22,13 +25,19 @@ except ImportError:
     pass
 
 import httpx
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, field_validator
 import shutil
 
+# Auth deps — pip install passlib[bcrypt] python-jose[cryptography]
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+
 # ─── App ──────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AI Viral Clipper Backend", version="3.1.0")
+app = FastAPI(title="AI Viral Clipper Backend", version="3.2.0")
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
@@ -47,12 +56,19 @@ app.add_middleware(
 # ─── AI Config ────────────────────────────────────────────────────────────────
 OPENROUTER_BASE    = "https://openrouter.ai/api/v1"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")      # OpenAI Whisper (paid)
-GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")        # Groq Whisper FREE ✅
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
+GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
 
 AI_MODELS = [
     "arcee-ai/trinity-large-preview:free",
 ]
+
+# ─── Supabase / Auth Config ───────────────────────────────────────────────────
+SUPABASE_URL              = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+JWT_SECRET                = os.getenv("JWT_SECRET", "CHANGE_ME_USE_RANDOM_SECRET_STRING")
+JWT_ALGORITHM             = "HS256"
+JWT_EXPIRE_HOURS          = int(os.getenv("JWT_EXPIRE_HOURS", "168"))  # 7 hari
 
 # ─── Temp dir ─────────────────────────────────────────────────────────────────
 TEMP_DIR = Path(tempfile.gettempdir()) / "clipper-ai"
@@ -62,6 +78,209 @@ FONT_CACHE_DIR = TEMP_DIR / "fonts"
 FONT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _FONT_PATH_CACHE: dict[str, str] = {}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTH UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def _safe_password(plain: str) -> str:
+    encoded = plain.encode("utf-8")
+    return encoded[:72].decode("utf-8", errors="ignore")
+
+def hash_password(plain: str) -> str:
+    return pwd_ctx.hash(_safe_password(plain))
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_ctx.verify(_safe_password(plain), hashed)
+
+
+def create_access_token(user_id: str, email: str, name: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
+    payload = {
+        "sub":   user_id,
+        "email": email,
+        "name":  name,
+        "exp":   expire,
+        "iat":   datetime.now(timezone.utc),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token tidak valid atau kedaluwarsa")
+
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> dict:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Autentikasi diperlukan")
+    return decode_token(credentials.credentials)
+
+
+# ─── Supabase REST helpers ────────────────────────────────────────────────────
+
+def _supa_headers() -> dict:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(500, "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY belum dikonfigurasi")
+    return {
+        "apikey":        SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=representation",
+    }
+
+
+async def supa_find_user_by_email(email: str) -> Optional[dict]:
+    url = f"{SUPABASE_URL}/rest/v1/users?email=eq.{quote(email)}&limit=1"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, headers=_supa_headers())
+    if not r.is_success:
+        raise HTTPException(502, f"Supabase error: {r.text[:200]}")
+    rows = r.json()
+    return rows[0] if rows else None
+
+async def supa_find_users_by_email(email: str) -> list[dict]:
+    """Return SEMUA user dengan email ini — handle kasus duplikat."""
+    url = f"{SUPABASE_URL}/rest/v1/users?email=eq.{quote(email)}&limit=10"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, headers=_supa_headers())
+    if not r.is_success:
+        raise HTTPException(502, f"Supabase error: {r.text[:200]}")
+    return r.json() or []
+
+async def supa_create_user(name: str, email: str, password_hash: str) -> dict:
+    url = f"{SUPABASE_URL}/rest/v1/users"
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(
+            url,
+            headers=_supa_headers(),
+            json={"name": name, "email": email, "password_hash": password_hash},
+        )
+    if not r.is_success:
+        detail = r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text
+        if r.status_code in (409, 422) or "unique" in str(detail).lower():
+            raise HTTPException(409, "Email sudah terdaftar")
+        raise HTTPException(502, f"Supabase error: {str(detail)[:200]}")
+    rows = r.json()
+    return rows[0] if isinstance(rows, list) else rows
+
+
+# ─── Auth Pydantic schemas ────────────────────────────────────────────────────
+
+class SignUpRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+    confirm_password: str
+
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if len(v) < 2:
+            raise ValueError("Nama minimal 2 karakter")
+        return v
+
+    @field_validator("email")
+    @classmethod
+    def email_lower(cls, v: str) -> str:
+        return v.strip().lower()
+
+    @field_validator("password")
+    @classmethod
+    def password_strength(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password minimal 8 karakter")
+        return v
+
+    @field_validator("confirm_password")
+    @classmethod
+    def passwords_match(cls, v: str, info) -> str:
+        if "password" in info.data and v != info.data["password"]:
+            raise ValueError("Password tidak cocok")
+        return v
+
+
+class SignInRequest(BaseModel):
+    email: str
+    password: str
+
+    @field_validator("email")
+    @classmethod
+    def email_lower(cls, v: str) -> str:
+        return v.strip().lower()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTH ROUTES
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/auth/signup")
+async def signup(body: SignUpRequest):
+    """Daftarkan user baru. Return JWT token."""
+    existing = await supa_find_user_by_email(body.email)
+    if existing:
+        raise HTTPException(409, "Email sudah terdaftar")
+
+    pw_hash = hash_password(body.password)
+    user    = await supa_create_user(body.name, body.email, pw_hash)
+
+    token = create_access_token(
+        user_id=str(user["id"]),
+        email=user["email"],
+        name=user["name"],
+    )
+    return {
+        "token": token,
+        "user":  {"id": user["id"], "name": user["name"], "email": user["email"]},
+    }
+
+
+@app.post("/api/auth/signin")
+async def signin(body: SignInRequest):
+    """Login. Return JWT token."""
+    # Ambil SEMUA akun dengan email ini (antisipasi duplikat)
+    users = await supa_find_users_by_email(body.email)
+
+    matched_user = None
+    for user in users:
+        if verify_password(body.password, user.get("password_hash", "")):
+            matched_user = user
+            break
+
+    if not matched_user:
+        raise HTTPException(401, "Email atau password salah")
+
+    token = create_access_token(
+        user_id=str(matched_user["id"]),
+        email=matched_user["email"],
+        name=matched_user["name"],
+    )
+    return {
+        "token": token,
+        "user":  {"id": matched_user["id"], "name": matched_user["name"], "email": matched_user["email"]},
+    }
+
+
+@app.get("/api/auth/me")
+async def me(current_user: dict = Depends(get_current_user)):
+    """Verifikasi token dan return info user."""
+    return {
+        "id":    current_user["sub"],
+        "name":  current_user.get("name"),
+        "email": current_user.get("email"),
+    }
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FFMPEG DETECTION
@@ -252,10 +471,6 @@ async def resolve_fonts_for_overlays(overlays: list[dict]) -> dict[str, Optional
 # ══════════════════════════════════════════════════════════════════════════════
 
 def save_image_overlay_to_temp(img_data_url: str, idx: int) -> Optional[Path]:
-    """
-    Decode a base64 data URL (e.g. "data:image/png;base64,iVBOR…")
-    and write it to a temp file.  Returns the Path or None on failure.
-    """
     try:
         if not img_data_url or "," not in img_data_url:
             return None
@@ -263,7 +478,6 @@ def save_image_overlay_to_temp(img_data_url: str, idx: int) -> Optional[Path]:
         header, data = img_data_url.split(",", 1)
         header_lower = header.lower()
 
-        # Detect extension from MIME type in header
         ext = ".png"
         if "jpeg" in header_lower or "jpg" in header_lower:
             ext = ".jpg"
@@ -299,15 +513,16 @@ async def extract_audio_segment(
     duration_sec: float,
     output_path: Path,
 ) -> bool:
-    """Extract audio from video segment as mp3 for Whisper."""
     cmd = [
         FFMPEG_BIN, "-y",
         "-ss", str(start_sec),
         "-i", str(video_path),
         "-t", str(duration_sec),
         "-vn",
+        "-vn",
         "-acodec", "libmp3lame",
         "-ab", "128k",
+        "-ar", "16000",
         "-ar", "16000",
         str(output_path),
     ]
@@ -331,6 +546,7 @@ async def call_whisper_groq(audio_path: Path, language: Optional[str] = None) ->
             audio_bytes = f.read()
 
         data = {
+            "model":             "whisper-large-v3-turbo",
             "model":             "whisper-large-v3-turbo",
             "response_format":   "verbose_json",
             "timestamp_granularities[]": "word",
@@ -578,7 +794,6 @@ def escape_drawtext(text: str) -> str:
     return text
 
 
-# ── Font reference width: font size disimpan sbg "px di 1080px lebar" ─────────
 FONT_REFERENCE_WIDTH = 1080.0
 
 
@@ -588,20 +803,14 @@ def build_ffmpeg_filters(
 ) -> list[str]:
     filters: list[str] = []
 
-    # ── Aspect ratio crop ────────────────────────────────────────────────────
     aspect_ratio = edits.get("aspectRatio", "original")
     if aspect_ratio and aspect_ratio != "original":
         rw, rh = [int(x) for x in aspect_ratio.split(":")]
         crop_w = f"if(gt(iw/ih\\,{rw}/{rh})\\,trunc(ih*{rw}/{rh}/2)*2\\,iw)"
         crop_h = f"if(gt(iw/ih\\,{rw}/{rh})\\,ih\\,trunc(iw*{rh}/{rw}/2)*2)"
         filters.append(f"crop={crop_w}:{crop_h}:(iw-out_w)/2:(ih-out_h)/2")
-        # ── FIX: force 1:1 SAR after crop ────────────────────────────────────
-        # Without this, some source videos with non-square SAR (e.g. anamorphic)
-        # cause ffmpeg to apply display-aspect-ratio scaling to the output,
-        # stretching the final video. setsar=1:1 locks pixels to square.
         filters.append("setsar=1:1")
 
-    # ── Color eq ─────────────────────────────────────────────────────────────
     eq_parts   = []
     brightness = edits.get("brightness", 0)
     contrast   = edits.get("contrast", 0)
@@ -615,12 +824,10 @@ def build_ffmpeg_filters(
     if eq_parts:
         filters.append(f"eq={':'.join(eq_parts)}")
 
-    # ── Speed ─────────────────────────────────────────────────────────────────
     speed = edits.get("speed", 1)
     if speed and speed != 1:
         filters.append(f"setpts={1 / speed:.6f}*PTS")
 
-    # ── Text overlays ─────────────────────────────────────────────────────────
     text_overlays = edits.get("textOverlays", [])
     if not DRAWTEXT_OK and text_overlays:
         print("⚠️  Subtitles skipped — ffmpeg missing drawtext filter")
@@ -739,33 +946,17 @@ def build_filter_complex_with_images(
     image_overlays: list[dict],
     img_paths: list[Path],
 ) -> tuple[str, str]:
-    """
-    Build a -filter_complex string that:
-      1. Applies base video filters (crop, setsar, eq, setpts, drawtext) to [0:v]
-      2. Chains each image overlay on top using split + scale + overlay
-
-    image_overlays and img_paths must be the same length (pre-validated).
-
-    Returns:
-      filter_complex_str  – full string for -filter_complex flag
-      final_label         – the output label to pass to -map
-    """
     parts: list[str] = []
 
-    # ── Step 1: apply base video filters ─────────────────────────────────────
     if base_filters:
         parts.append(f"[0:v]{','.join(base_filters)}[vbase0]")
     else:
-        # Simple passthrough — null filter keeps the stream clean
         parts.append("[0:v]null[vbase0]")
 
     current = "vbase0"
 
-    # ── Step 2: chain each image overlay ─────────────────────────────────────
     for i, (img, img_path) in enumerate(zip(image_overlays, img_paths)):
-        # video = input 0 ; images = inputs 1, 2, 3 …
-        input_idx = i + 1
-
+        input_idx   = i + 1
         width_ratio = max(0.01, min(1.0, float(img.get("width", 0.25))))
         opacity     = max(0.0,  min(1.0, float(img.get("opacity", 1.0))))
         x_pct       = float(img.get("x", 0.5))
@@ -775,47 +966,22 @@ def build_filter_complex_with_images(
 
         raw_label   = f"imgraw{i}"
         alpha_label = f"imgalpha{i}"
-        # Two split outputs: one for scale reference, one for overlay base
         vref_label  = f"vref{i}"
         vbase_label = f"vbase_ov{i}"
         next_base   = f"vbase{i + 1}"
 
-        # ── 2a. Split the current video stream into two ───────────────────────
-        #
-        # WHY: The modern `scale` filter (replacing deprecated scale2ref) takes
-        # the video as its SECOND input to obtain reference dimensions via `rw`/`rh`.
-        # However, `scale` CONSUMES its reference input — it does not pass it
-        # through. So we must split the video: one copy goes to `scale` as the
-        # reference (consumed), the other goes directly to `overlay` as the base.
-        #
         parts.append(f"[{current}]split[{vref_label}][{vbase_label}]")
-
-        # ── 2b. Scale image to (video_width × width_ratio) ───────────────────
-        #
-        # FILTER HISTORY:
-        #   scale2ref was deprecated in newer ffmpeg builds. Its replacement is
-        #   `scale=w=rw*ratio:h=-1` where `rw`/`rh` are the reference stream's
-        #   dimensions (available when a second input is provided to scale).
-        #
-        #   The syntax `[image][video_ref]scale=w=rw*ratio:h=-1[scaled_image]`
-        #   outputs ONLY the scaled image — reference is consumed, not passed through.
-        #   That is why the split in step 2a is required.
-        #
         parts.append(
             f"[{input_idx}:v][{vref_label}]"
             f"scale=w=rw*{width_ratio:.4f}:h=-1"
             f"[{raw_label}]"
         )
-
-        # ── 2c. Force RGBA and apply opacity ──────────────────────────────────
         parts.append(
             f"[{raw_label}]format=rgba,"
             f"colorchannelmixer=aa={opacity:.3f}"
             f"[{alpha_label}]"
         )
 
-        # ── 2d. Overlay: center anchor at (x%, y%) of the video ──────────────
-        # W/H here refer to the base (video) stream dimensions in overlay context.
         x_expr = f"W*{x_pct:.4f}-w/2"
         y_expr = f"H*{y_pct:.4f}-h/2"
 
@@ -877,7 +1043,6 @@ async def test_font(
     return {"ok": False, "family": family, "path": path}
 
 
-# ─── POST /api/get-video-duration ─────────────────────────────────────────────
 @app.post("/api/get-video-duration")
 async def get_video_duration(video: UploadFile = File(...)):
     tmp_path = TEMP_DIR / f"dur_{os.urandom(8).hex()}{Path(video.filename or 'x.mp4').suffix}"
@@ -901,7 +1066,6 @@ async def get_video_duration(video: UploadFile = File(...)):
         safe_delete(tmp_path)
 
 
-# ─── POST /api/analyze-video ──────────────────────────────────────────────────
 @app.post("/api/analyze-video")
 async def analyze_video(
     file_name: str   = Form(...),
@@ -975,7 +1139,6 @@ JSON:
     }
 
 
-# ─── POST /api/generate-clip-content ─────────────────────────────────────────
 @app.post("/api/generate-clip-content")
 async def generate_clip_content(
     moment_label:    str   = Form(...),
@@ -1004,7 +1167,6 @@ JSON: {{"titles":["...","...","..."],"captions":["...dengan emoji","...singkat"]
     return json.loads(cleaned)
 
 
-# ─── POST /api/auto-subtitle ──────────────────────────────────────────────────
 @app.post("/api/auto-subtitle")
 async def auto_subtitle(
     video:      UploadFile = File(...),
@@ -1053,7 +1215,6 @@ async def auto_subtitle(
         safe_delete(audio_path)
 
 
-# ─── POST /api/export-clip ────────────────────────────────────────────────────
 @app.post("/api/export-clip")
 async def export_clip(
     video:     UploadFile = File(...),
@@ -1062,6 +1223,8 @@ async def export_clip(
 ):
     suffix      = Path(video.filename or "source.mp4").suffix or ".mp4"
     upload_path = TEMP_DIR / f"upload_{os.urandom(8).hex()}{suffix}"
+
+    img_temp_files: list[Path] = []
 
     img_temp_files: list[Path] = []
 
@@ -1078,14 +1241,15 @@ async def export_clip(
 
         text_overlays  = edits.get("textOverlays", [])
         image_overlays = edits.get("imageOverlays", [])
+        text_overlays  = edits.get("textOverlays", [])
+        image_overlays = edits.get("imageOverlays", [])
 
-        # ── Resolve fonts ─────────────────────────────────────────────────────
         resolved_fonts: dict[str, Optional[str]] = {}
         if DRAWTEXT_OK and text_overlays:
             print(f"🔤 Resolving fonts for {len(text_overlays)} text overlays…")
+            print(f"🔤 Resolving fonts for {len(text_overlays)} text overlays…")
             resolved_fonts = await resolve_fonts_for_overlays(text_overlays)
 
-        # ── Decode image overlays to temp files ───────────────────────────────
         valid_image_overlays: list[dict] = []
         for i, img in enumerate(image_overlays):
             src = img.get("src", "")
@@ -1099,7 +1263,6 @@ async def export_clip(
         has_text_overlays  = DRAWTEXT_OK and bool(text_overlays)
         has_image_overlays = bool(valid_image_overlays)
 
-        # ── Base video filters (crop / setsar / eq / speed / drawtext) ────────
         base_filters = build_ffmpeg_filters(edits, resolved_fonts)
 
         print(
@@ -1107,48 +1270,18 @@ async def export_clip(
             f"text={len(text_overlays)} images={len(valid_image_overlays)}"
         )
 
-        # ══════════════════════════════════════════════════════════════════════
-        # Build ffmpeg command
-        #
-        # BUG FIX — 145MB file size (full video exported instead of clip):
-        #
-        #   Root cause: ffmpeg option scope depends on position relative to -i.
-        #   An option placed BEFORE -i is an INPUT option (applies to that input).
-        #   An option placed AFTER all -i flags is an OUTPUT option.
-        #
-        #   OLD (broken):
-        #     ffmpeg -ss {start} -i video.mp4 -t {dur}   ← -t after first -i
-        #            -loop 1 -i img.png                  ← second -i added
-        #     Result: -t between two -i flags → ffmpeg treats it as INPUT option
-        #             for the NEXT input (img.png), NOT as output duration.
-        #             Video has no duration limit → encodes full 13:41 source.
-        #
-        #   NEW (correct):
-        #     ffmpeg -ss {start} -t {dur} -i video.mp4   ← -t BEFORE -i (input opt)
-        #            -loop 1 -t {dur} -i img.png          ← -t before each image too
-        #            [filters...]
-        #            -t {dur}                             ← output option (hard cap)
-        #
-        #   Triple belt-and-suspenders:
-        #     1. -t before -i video   → limits how much of the source is read
-        #     2. -t before -i img     → limits image loop duration
-        #     3. -t after all inputs  → hard output duration cap regardless of filters
-        # ══════════════════════════════════════════════════════════════════════
-
         args = [
             FFMPEG_BIN, "-y",
-            # ── Input options for main video (ALL before -i) ──────────────────
-            "-ss", seconds_to_ffmpeg(start_sec),     # fast keyframe seek
-            "-t",  seconds_to_ffmpeg(duration_sec),  # FIX: limit read to clip length
+            "-ss", seconds_to_ffmpeg(start_sec),
+            "-t",  seconds_to_ffmpeg(duration_sec),
             "-i",  str(upload_path),
         ]
 
         if has_image_overlays:
-            # Each image needs its own -t INPUT option before -loop 1 -i img
             for img_path in img_temp_files:
                 args += [
                     "-loop", "1",
-                    "-t",   seconds_to_ffmpeg(duration_sec),  # FIX: limit loop duration
+                    "-t",   seconds_to_ffmpeg(duration_sec),
                     "-i",   str(img_path),
                 ]
 
@@ -1161,36 +1294,32 @@ async def export_clip(
             args += [
                 "-filter_complex", filter_complex,
                 "-map", f"[{final_label}]",
-                "-map", "0:a?",   # optional audio from main video
+                "-map", "0:a?",
             ]
 
             if speed != 1:
                 args += ["-af", f"atempo={max(0.5, min(2.0, speed))}"]
 
-            # Hard output duration cap — runs after all filters
             args += ["-t", seconds_to_ffmpeg(duration_sec)]
 
         else:
-            # Simple -vf path (no image overlays)
-            # -t is already set as input option above (before -i video)
             if base_filters:
                 args += ["-vf", ",".join(base_filters)]
             if speed != 1:
                 args += ["-af", f"atempo={max(0.5, min(2.0, speed))}"]
 
-        # ── Encoder settings ──────────────────────────────────────────────────
-        # veryfast preset: ~40% smaller than ultrafast, minimal extra CPU time
         args += [
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k",
             "-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "pipe:1",
         ]
 
-        # ── Execute ffmpeg ────────────────────────────────────────────────────
         use_buffered = has_image_overlays or has_text_overlays
         file_name    = f"clip_{int(start_sec)}_{int(start_sec + duration_sec)}.mp4"
 
+        if use_buffered:
         if use_buffered:
             process = await asyncio.create_subprocess_exec(
                 *args,
@@ -1203,10 +1332,15 @@ async def export_clip(
                 safe_delete(p)
             img_temp_files.clear()
 
+            for p in img_temp_files:
+                safe_delete(p)
+            img_temp_files.clear()
+
             if process.returncode != 0 or len(stdout_data) == 0:
                 err = stderr_data.decode("utf-8", errors="replace")
                 print(f"[ffmpeg error]\n{err[-800:]}")
                 safe_delete(upload_path)
+
 
                 hint = ""
                 if "No such file or directory" in err and "font" in err.lower():
@@ -1215,9 +1349,15 @@ async def export_clip(
                     hint = " (drawtext filter error)"
                 elif "scale2ref" in err.lower() or "overlay" in err.lower():
                     hint = " (image overlay filter error)"
+                elif "scale2ref" in err.lower() or "overlay" in err.lower():
+                    hint = " (image overlay filter error)"
                 raise HTTPException(500, f"ffmpeg failed{hint}: {err[-300:]}")
 
             safe_delete(upload_path)
+            print(
+                f"✅ Export OK — {len(stdout_data):,} bytes "
+                f"(buffered, images={len(valid_image_overlays)}, dur={duration_sec:.1f}s)"
+            )
             print(
                 f"✅ Export OK — {len(stdout_data):,} bytes "
                 f"(buffered, images={len(valid_image_overlays)}, dur={duration_sec:.1f}s)"
@@ -1266,7 +1406,12 @@ async def export_clip(
                             f"[ffmpeg error]\n"
                             f"{b''.join(stderr_buf).decode(errors='replace')[-500:]}"
                         )
+                        print(
+                            f"[ffmpeg error]\n"
+                            f"{b''.join(stderr_buf).decode(errors='replace')[-500:]}"
+                        )
                     else:
+                        print(f"✅ Export OK — {total:,} bytes (streaming, dur={duration_sec:.1f}s)")
                         print(f"✅ Export OK — {total:,} bytes (streaming, dur={duration_sec:.1f}s)")
                 finally:
                     safe_delete(upload_path)
@@ -1287,9 +1432,13 @@ async def export_clip(
         safe_delete(upload_path)
         for p in img_temp_files:
             safe_delete(p)
+        for p in img_temp_files:
+            safe_delete(p)
         raise
     except Exception as e:
         safe_delete(upload_path)
+        for p in img_temp_files:
+            safe_delete(p)
         for p in img_temp_files:
             safe_delete(p)
         print(f"[export exception] {e}")
