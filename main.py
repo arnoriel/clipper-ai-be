@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
+import hashlib
 
 # Load .env file (untuk development lokal)
 try:
@@ -87,8 +88,11 @@ pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 def _safe_password(plain: str) -> str:
-    encoded = plain.encode("utf-8")
-    return encoded[:72].decode("utf-8", errors="ignore")
+    """
+    Hash password ke SHA-256 dulu (hex = 64 chars, aman untuk bcrypt),
+    sehingga input ke bcrypt tidak pernah melebihi 72 bytes.
+    """
+    return hashlib.sha256(plain.encode("utf-8")).hexdigest()
 
 def hash_password(plain: str) -> str:
     return pwd_ctx.hash(_safe_password(plain))
