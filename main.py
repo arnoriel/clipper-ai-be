@@ -1320,7 +1320,6 @@ async def export_clip(
         file_name    = f"clip_{int(start_sec)}_{int(start_sec + duration_sec)}.mp4"
 
         if use_buffered:
-        if use_buffered:
             process = await asyncio.create_subprocess_exec(
                 *args,
                 stdout=asyncio.subprocess.PIPE,
