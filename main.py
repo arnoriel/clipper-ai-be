@@ -1382,7 +1382,7 @@ async def download_youtube(url: str = Form(...)):
                 media_type="video/mp4",
                 headers={
                     "X-File-Name": filename,
-                    "Access-Control-Expose-Headers": "X-File-Name",
+                    "Access-Control-Expose-Headers": "X-File-Name, Content-Length",
                     "Content-Length": str(file_size),
                 }
             )
@@ -1390,6 +1390,72 @@ async def download_youtube(url: str = Form(...)):
     except Exception as e:
         print(f"[youtube download error] {e}")
         raise HTTPException(500, f"Gagal memproses video YouTube: {str(e)}")
+
+
+# ─── POST /api/generate-subtitle ──────────────────────────────────────────────
+def _format_vtt_time(seconds: float) -> str:
+    h, rem = divmod(int(seconds), 3600)
+    m, sec = divmod(rem, 60)
+    ms = int((seconds - int(seconds)) * 1000)
+    return f"{h:02d}:{m:02d}:{sec:02d}.{ms:03d}"
+
+@app.post("/api/generate-subtitle")
+async def generate_subtitle(
+    video: UploadFile = File(...),
+    start_sec: float = Form(0.0),
+    duration: float = Form(...)
+):
+    upload_path = None
+    mp3_path = None
+    
+    try:
+        # 1. Save uploaded video to temp
+        ext = Path(video.filename or "video.mp4").suffix
+        if not ext: ext = ".mp4"
+        upload_path = TEMP_DIR / f"vid_sub_{os.urandom(8).hex()}{ext}"
+        
+        with upload_path.open("wb") as f:
+            shutil.copyfileobj(video.file, f)
+            
+        # 2. Extract Audio segment
+        mp3_path = TEMP_DIR / f"aud_{os.urandom(8).hex()}.mp3"
+        print(f"🎙️  Extracting audio: start={start_sec}s, dur={duration}s")
+        success = await extract_audio_segment(upload_path, start_sec, duration, mp3_path)
+        
+        if not success:
+            raise HTTPException(500, "Gagal mengekstrak audio dari video referensi.")
+            
+        # 3. Call Whisper
+        print("🤖 Menjalankan AI Whisper Subtitle...")
+        whisper_res = await call_whisper_api(mp3_path)
+        raw_words = whisper_res.get("words", [])
+        
+        if not raw_words:
+            return {"vtt": "WEBVTT\n\n00:00:00.000 --> 00:00:05.000\nTidak ada suara yang terdeteksi."}
+            
+        # 4. Group Words (3 words per subtitle chunk)
+        grouped = group_words_to_subtitles(raw_words, words_per_chunk=3)
+        
+        # 5. Build VTT String
+        # Note: Frontend displays subtitle locally. The original time starts from 0 of the segment cropped.
+        vtt_lines = ["WEBVTT\n"]
+        for i, chunk in enumerate(grouped, 1):
+            t_start = _format_vtt_time(chunk["start"])
+            t_end = _format_vtt_time(chunk["end"])
+            text = chunk["text"]
+            vtt_lines.append(f"{i}\n{t_start} --> {t_end}\n{text}\n")
+            
+        vtt_string = "\n".join(vtt_lines)
+        return {"vtt": vtt_string}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[generate subtitle error] {e}")
+        raise HTTPException(500, f"Gagal membuat subtitle otomatis: {e}")
+    finally:
+        safe_delete(upload_path)
+        safe_delete(mp3_path)
 
 
 # ─── Run (dev) ────────────────────────────────────────────────────────────────
