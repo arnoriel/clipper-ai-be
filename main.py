@@ -8,7 +8,6 @@ import os
 import re
 import json
 import base64 as b64
-import base64 as b64
 import asyncio
 import tempfile
 import subprocess
@@ -37,8 +36,17 @@ import shutil
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 
+# ─── OpenCV availability check ────────────────────────────────────────────────
+try:
+    import cv2 as _cv2
+    _OPENCV_AVAILABLE = True
+    print(f"✅ OpenCV available: {_cv2.__version__}")
+except ImportError:
+    _OPENCV_AVAILABLE = False
+    print("⚠️  OpenCV not available. Install: pip install opencv-python-headless")
+
 # ─── App ──────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AI Viral Clipper Backend", version="3.2.0")
+app = FastAPI(title="AI Viral Clipper Backend", version="3.3.0")
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
@@ -88,10 +96,6 @@ pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 def _safe_password(plain: str) -> str:
-    """
-    Hash password ke SHA-256 dulu (hex = 64 chars, aman untuk bcrypt),
-    sehingga input ke bcrypt tidak pernah melebihi 72 bytes.
-    """
     return hashlib.sha256(plain.encode("utf-8")).hexdigest()
 
 def hash_password(plain: str) -> str:
@@ -154,7 +158,6 @@ async def supa_find_user_by_email(email: str) -> Optional[dict]:
     return rows[0] if rows else None
 
 async def supa_find_users_by_email(email: str) -> list[dict]:
-    """Return SEMUA user dengan email ini — handle kasus duplikat."""
     url = f"{SUPABASE_URL}/rest/v1/users?email=eq.{quote(email)}&limit=10"
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(url, headers=_supa_headers())
@@ -231,14 +234,11 @@ class SignInRequest(BaseModel):
 
 @app.post("/api/auth/signup")
 async def signup(body: SignUpRequest):
-    """Daftarkan user baru. Return JWT token."""
     existing = await supa_find_user_by_email(body.email)
     if existing:
         raise HTTPException(409, "Email sudah terdaftar")
-
     pw_hash = hash_password(body.password)
     user    = await supa_create_user(body.name, body.email, pw_hash)
-
     token = create_access_token(
         user_id=str(user["id"]),
         email=user["email"],
@@ -252,19 +252,14 @@ async def signup(body: SignUpRequest):
 
 @app.post("/api/auth/signin")
 async def signin(body: SignInRequest):
-    """Login. Return JWT token."""
-    # Ambil SEMUA akun dengan email ini (antisipasi duplikat)
     users = await supa_find_users_by_email(body.email)
-
     matched_user = None
     for user in users:
         if verify_password(body.password, user.get("password_hash", "")):
             matched_user = user
             break
-
     if not matched_user:
         raise HTTPException(401, "Email atau password salah")
-
     token = create_access_token(
         user_id=str(matched_user["id"]),
         email=matched_user["email"],
@@ -278,7 +273,6 @@ async def signin(body: SignInRequest):
 
 @app.get("/api/auth/me")
 async def me(current_user: dict = Depends(get_current_user)):
-    """Verifikasi token dan return info user."""
     return {
         "id":    current_user["sub"],
         "name":  current_user.get("name"),
@@ -508,6 +502,316 @@ def save_image_overlay_to_temp(img_data_url: str, idx: int) -> Optional[Path]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# AI MOTION FACIAL TRACKING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fill_kf_gaps(raw: list[dict], detected: list[dict]) -> list[dict]:
+    """Fill undetected frames by linear interpolation between detected ones."""
+    result = []
+    for kf in raw:
+        if kf["detected"]:
+            result.append({"t": kf["t"], "cx": kf["cx"], "cy": kf["cy"]})
+        else:
+            prev_det = next((d for d in reversed(detected) if d["t"] <= kf["t"]), None)
+            next_det = next((d for d in detected if d["t"] > kf["t"]), None)
+
+            if prev_det and next_det:
+                dt = next_det["t"] - prev_det["t"]
+                ratio = (kf["t"] - prev_det["t"]) / dt if dt > 0 else 0.0
+                cx = prev_det["cx"] + (next_det["cx"] - prev_det["cx"]) * ratio
+                cy = prev_det["cy"] + (next_det["cy"] - prev_det["cy"]) * ratio
+            elif prev_det:
+                cx, cy = prev_det["cx"], prev_det["cy"]
+            elif next_det:
+                cx, cy = next_det["cx"], next_det["cy"]
+            else:
+                cx, cy = 0.5, 0.4
+
+            result.append({"t": kf["t"], "cx": cx, "cy": cy})
+    return result
+
+
+def _smooth_kf(keyframes: list[dict], alpha: float = 0.2) -> list[dict]:
+    """Bidirectional exponential smoothing for smooth camera movement."""
+    if not keyframes:
+        return keyframes
+
+    # Forward pass
+    fwd = [{"t": keyframes[0]["t"], "cx": keyframes[0]["cx"], "cy": keyframes[0]["cy"]}]
+    for kf in keyframes[1:]:
+        fwd.append({
+            "t":  kf["t"],
+            "cx": alpha * kf["cx"] + (1.0 - alpha) * fwd[-1]["cx"],
+            "cy": alpha * kf["cy"] + (1.0 - alpha) * fwd[-1]["cy"],
+        })
+
+    # Backward pass
+    bwd = list(reversed(fwd))
+    for i in range(1, len(bwd)):
+        bwd[i]["cx"] = alpha * bwd[i]["cx"] + (1.0 - alpha) * bwd[i - 1]["cx"]
+        bwd[i]["cy"] = alpha * bwd[i]["cy"] + (1.0 - alpha) * bwd[i - 1]["cy"]
+
+    return list(reversed(bwd))
+
+
+def _decimate_kf(keyframes: list[dict], max_count: int = 80) -> list[dict]:
+    """Uniform sub-sampling to cap keyframe count."""
+    if len(keyframes) <= max_count:
+        return keyframes
+    step = len(keyframes) / max_count
+    return [keyframes[int(i * step)] for i in range(max_count)]
+
+
+def _compute_crop_dimensions(vid_w: int, vid_h: int, aspect_ratio: str) -> tuple[int, int]:
+    """Compute pixel crop dimensions for a given aspect ratio string e.g. '9:16'."""
+    ar_w, ar_h = [int(x) for x in aspect_ratio.split(":")]
+    if vid_w / vid_h > ar_w / ar_h:
+        crop_h = vid_h
+        crop_w = (int(vid_h * ar_w / ar_h) // 2) * 2
+    else:
+        crop_w = vid_w
+        crop_h = (int(vid_w * ar_h / ar_w) // 2) * 2
+    crop_w = min(crop_w, vid_w)
+    crop_h = min(crop_h, vid_h)
+    return crop_w, crop_h
+
+
+def build_motion_tracking_crop(
+    keyframes: list[dict],
+    crop_w: int,
+    crop_h: int,
+    vid_w: int,
+    vid_h: int,
+) -> str:
+    """
+    Build ffmpeg crop=W:H:x_expr:y_expr with piecewise-linear keyframe interpolation.
+    keyframes: [{t, cx, cy}] — t in seconds, cx/cy normalized 0-1 (crop CENTER).
+    """
+    max_x = max(0, vid_w - crop_w)
+    max_y = max(0, vid_h - crop_h)
+
+    def to_px_x(kf: dict) -> int:
+        return int(max(0, min(max_x, kf["cx"] * vid_w - crop_w / 2)))
+
+    def to_px_y(kf: dict) -> int:
+        return int(max(0, min(max_y, kf["cy"] * vid_h - crop_h / 2)))
+
+    if not keyframes:
+        return f"crop={crop_w}:{crop_h}:{max_x // 2}:{max_y // 2}"
+
+    if len(keyframes) == 1:
+        return f"crop={crop_w}:{crop_h}:{to_px_x(keyframes[0])}:{to_px_y(keyframes[0])}"
+
+    def build_axis_expr(get_px) -> str:
+        # Build nested if() from right to left for piecewise linear interpolation
+        # Commas inside if() escaped as \\, for ffmpeg filter arg parsing
+        expr = str(get_px(keyframes[-1]))
+
+        for i in range(len(keyframes) - 2, -1, -1):
+            kf0 = keyframes[i]
+            kf1 = keyframes[i + 1]
+            t0  = round(kf0["t"], 3)
+            t1  = round(kf1["t"], 3)
+            p0  = get_px(kf0)
+            p1  = get_px(kf1)
+            dt  = round(t1 - t0, 3)
+
+            if dt < 0.001 or p0 == p1:
+                seg = str(p0)
+            else:
+                dp = p1 - p0
+                seg = f"({p0}+{dp}*(t-{t0})/{dt})"
+
+            expr = f"if(lt(t\\,{t1})\\,{seg}\\,{expr})"
+
+        # Clamp: before first keyframe use first value
+        t_first = round(keyframes[0]["t"], 3)
+        p_first = get_px(keyframes[0])
+        expr = f"if(lt(t\\,{t_first})\\,{p_first}\\,{expr})"
+
+        return expr
+
+    x_expr = build_axis_expr(to_px_x)
+    y_expr = build_axis_expr(to_px_y)
+
+    return f"crop={crop_w}:{crop_h}:{x_expr}:{y_expr}"
+
+
+async def analyze_video_motion(
+    video_path: Path,
+    start_sec: float,
+    end_sec: float,
+    aspect_ratio: str,
+) -> dict:
+    """
+    Detect face/person movement in a video clip.
+    Returns keyframes for motion tracking, or a single static center point.
+    Requires: pip install opencv-python-headless
+    """
+    if not _OPENCV_AVAILABLE:
+        return {
+            "hasTracking": False,
+            "isStatic": True,
+            "keyframes": None,
+            "message": "opencv-python-headless not installed on server",
+            "available": False,
+        }
+
+    import cv2
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return {
+            "hasTracking": False,
+            "isStatic": True,
+            "keyframes": None,
+            "message": "Cannot open video file",
+            "available": True,
+        }
+
+    fps     = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    vid_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vid_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    crop_w, crop_h = _compute_crop_dimensions(vid_w, vid_h, aspect_ratio)
+
+    # Load Haar cascades (bundled with OpenCV)
+    face_cascade  = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+    body_cascade  = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_upperbody.xml"
+    )
+
+    duration     = max(end_sec - start_sec, 1.0)
+    # Sample at up to 2 fps; cap total samples at 120
+    target_fps   = min(2.0, 120.0 / duration)
+    frame_step   = max(1, int(fps / target_fps))
+    start_frame  = int(start_sec * fps)
+    end_frame    = int(end_sec   * fps)
+
+    raw: list[dict] = []
+    frame_idx = start_frame
+
+    print(f"🎯 Motion analysis: {vid_w}x{vid_h}, crop={crop_w}x{crop_h}, "
+          f"duration={duration:.1f}s, step={frame_step}")
+
+    while frame_idx < end_frame:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        t_sec = round((frame_idx - start_frame) / fps, 3)
+
+        # Downscale for speed (target max dim = 480px)
+        scale = min(1.0, 480.0 / max(vid_w, vid_h, 1))
+        if scale < 0.99:
+            small = cv2.resize(frame, (int(vid_w * scale), int(vid_h * scale)))
+        else:
+            small = frame
+
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        cx, cy = None, None
+
+        # ── Face detection ──────────────────────────────────────────────────
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.15,
+            minNeighbors=4,
+            minSize=(int(20 * scale), int(20 * scale)),
+        )
+
+        if len(faces) > 0:
+            # If multiple faces detected (podcast dual-speaker), pick the
+            # one with the largest area (most prominent / closest to camera)
+            fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+            cx = (fx / scale + fw / scale / 2.0) / vid_w
+            cy = (fy / scale + fh / scale / 2.0) / vid_h
+        else:
+            # Fallback: upper-body detection for full-body movement videos
+            bodies = body_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=3,
+                minSize=(int(30 * scale), int(30 * scale)),
+            )
+            if len(bodies) > 0:
+                bx, by, bw, bh = max(bodies, key=lambda b: b[2] * b[3])
+                cx = (bx / scale + bw / scale / 2.0) / vid_w
+                cy = (by / scale + bh / scale / 2.0) / vid_h
+
+        raw.append({
+            "t":        t_sec,
+            "cx":       float(cx) if cx is not None else None,
+            "cy":       float(cy) if cy is not None else None,
+            "detected": cx is not None,
+        })
+
+        frame_idx += frame_step
+
+    cap.release()
+
+    # ── Evaluate detections ──────────────────────────────────────────────────
+    detected     = [kf for kf in raw if kf["detected"]]
+    detect_rate  = len(detected) / max(len(raw), 1)
+    print(f"   Detected {len(detected)}/{len(raw)} frames ({detect_rate:.0%})")
+
+    if len(detected) < 2 or detect_rate < 0.15:
+        return {
+            "hasTracking": False,
+            "isStatic":    True,
+            "keyframes":   [{"t": 0.0, "cx": 0.5, "cy": 0.4}],
+            "cropW": crop_w, "cropH": crop_h,
+            "vidW":  vid_w,  "vidH":  vid_h,
+            "message": "No person detected — center crop applied",
+            "available": True,
+        }
+
+    # ── Fill gaps, smooth, check movement ────────────────────────────────────
+    filled   = _fill_kf_gaps(raw, detected)
+    smoothed = _smooth_kf(filled, alpha=0.25)
+
+    cx_vals  = [kf["cx"] for kf in smoothed]
+    cy_vals  = [kf["cy"] for kf in smoothed]
+    cx_range = max(cx_vals) - min(cx_vals)
+    cy_range = max(cy_vals) - min(cy_vals)
+
+    MOVEMENT_THRESHOLD = 0.06  # 6% of frame dimension
+
+    if cx_range < MOVEMENT_THRESHOLD and cy_range < MOVEMENT_THRESHOLD:
+        avg_cx = sum(cx_vals) / len(cx_vals)
+        avg_cy = sum(cy_vals) / len(cy_vals)
+        print(f"   → Static: cx_range={cx_range:.3f}, cy_range={cy_range:.3f}")
+        return {
+            "hasTracking": False,
+            "isStatic":    True,
+            "keyframes":   [{"t": 0.0, "cx": round(avg_cx, 4), "cy": round(avg_cy, 4)}],
+            "cropW": crop_w, "cropH": crop_h,
+            "vidW":  vid_w,  "vidH":  vid_h,
+            "message": "Person is stationary — static crop applied to face",
+            "available": True,
+        }
+
+    # ── Motion detected — decimate and return ────────────────────────────────
+    final = _decimate_kf(smoothed, max_count=80)
+    print(f"   → Motion tracking: {len(final)} keyframes, "
+          f"cx_range={cx_range:.3f}, cy_range={cy_range:.3f}")
+
+    return {
+        "hasTracking": True,
+        "isStatic":    False,
+        "keyframes": [
+            {"t": round(kf["t"], 3), "cx": round(kf["cx"], 4), "cy": round(kf["cy"], 4)}
+            for kf in final
+        ],
+        "cropW": crop_w, "cropH": crop_h,
+        "vidW":  vid_w,  "vidH":  vid_h,
+        "message": f"Motion tracking enabled — {len(final)} keyframes detected",
+        "available": True,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # WHISPER AUTO-SUBTITLE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -523,10 +827,8 @@ async def extract_audio_segment(
         "-i", str(video_path),
         "-t", str(duration_sec),
         "-vn",
-        "-vn",
         "-acodec", "libmp3lame",
         "-ab", "128k",
-        "-ar", "16000",
         "-ar", "16000",
         str(output_path),
     ]
@@ -550,7 +852,6 @@ async def call_whisper_groq(audio_path: Path, language: Optional[str] = None) ->
             audio_bytes = f.read()
 
         data = {
-            "model":             "whisper-large-v3-turbo",
             "model":             "whisper-large-v3-turbo",
             "response_format":   "verbose_json",
             "timestamp_granularities[]": "word",
@@ -804,15 +1105,36 @@ FONT_REFERENCE_WIDTH = 1080.0
 def build_ffmpeg_filters(
     edits: dict,
     resolved_fonts: Optional[dict[str, Optional[str]]] = None,
+    motion_keyframes: Optional[list[dict]] = None,
+    vid_info: Optional[dict] = None,
 ) -> list[str]:
+    """
+    Build ffmpeg video filter list.
+    When motion_keyframes is provided together with vid_info and a non-original
+    aspect ratio, the static crop is replaced by a dynamic motion-tracking crop.
+    """
     filters: list[str] = []
 
     aspect_ratio = edits.get("aspectRatio", "original")
-    if aspect_ratio and aspect_ratio != "original":
+
+    if motion_keyframes and aspect_ratio and aspect_ratio != "original" and vid_info:
+        # ── Dynamic motion-tracking crop ──────────────────────────────────
+        vid_w = int(vid_info.get("w", 1920))
+        vid_h = int(vid_info.get("h", 1080))
+        crop_w, crop_h = _compute_crop_dimensions(vid_w, vid_h, aspect_ratio)
+        tracking_crop = build_motion_tracking_crop(
+            motion_keyframes, crop_w, crop_h, vid_w, vid_h
+        )
+        filters.append(tracking_crop)
+        filters.append("setsar=1:1")
+        print(f"🎯 Motion crop: {crop_w}x{crop_h}, {len(motion_keyframes)} keyframes")
+
+    elif aspect_ratio and aspect_ratio != "original":
+        # ── Static center crop ────────────────────────────────────────────
         rw, rh = [int(x) for x in aspect_ratio.split(":")]
-        crop_w = f"if(gt(iw/ih\\,{rw}/{rh})\\,trunc(ih*{rw}/{rh}/2)*2\\,iw)"
-        crop_h = f"if(gt(iw/ih\\,{rw}/{rh})\\,ih\\,trunc(iw*{rh}/{rw}/2)*2)"
-        filters.append(f"crop={crop_w}:{crop_h}:(iw-out_w)/2:(ih-out_h)/2")
+        crop_w_expr = f"if(gt(iw/ih\\,{rw}/{rh})\\,trunc(ih*{rw}/{rh}/2)*2\\,iw)"
+        crop_h_expr = f"if(gt(iw/ih\\,{rw}/{rh})\\,ih\\,trunc(iw*{rh}/{rw}/2)*2)"
+        filters.append(f"crop={crop_w_expr}:{crop_h_expr}:(iw-out_w)/2:(ih-out_h)/2")
         filters.append("setsar=1:1")
 
     eq_parts   = []
@@ -1022,15 +1344,16 @@ async def health():
     }.get(provider, provider)
 
     return {
-        "ok":          True,
-        "ffmpeg":      FFMPEG_BIN,
-        "drawtext":    DRAWTEXT_OK,
-        "font":        SYSTEM_FONT,
+        "ok":           True,
+        "ffmpeg":       FFMPEG_BIN,
+        "drawtext":     DRAWTEXT_OK,
+        "font":         SYSTEM_FONT,
         "stt_provider": provider,
-        "stt_detail":  stt_detail,
-        "mode":        "stream-only",
-        "tmpDir":      str(TEMP_DIR),
-        "ai_models":   AI_MODELS,
+        "stt_detail":   stt_detail,
+        "opencv":       _OPENCV_AVAILABLE,
+        "mode":         "stream-only",
+        "tmpDir":       str(TEMP_DIR),
+        "ai_models":    AI_MODELS,
     }
 
 
@@ -1066,6 +1389,66 @@ async def get_video_duration(video: UploadFile = File(...)):
             raise HTTPException(500, "ffprobe failed")
         info = json.loads(result.stdout)
         return {"duration": float(info.get("format", {}).get("duration", 0))}
+    finally:
+        safe_delete(tmp_path)
+
+
+# ── Motion Analysis Endpoint ─────────────────────────────────────────────────
+
+@app.post("/api/analyze-motion")
+async def analyze_motion_endpoint(
+    video:        UploadFile = File(...),
+    start_time:   float      = Form(...),
+    end_time:     float      = Form(...),
+    aspect_ratio: str        = Form(...),
+):
+    """
+    Analyze a video clip for person/face motion to enable dynamic crop tracking.
+    Triggered automatically when the user selects any crop ratio ≠ 'original'.
+
+    Returns:
+    - hasTracking: whether significant movement was detected
+    - isStatic: person is present but not moving (single optimal crop center)
+    - keyframes: [{t, cx, cy}] for interpolated tracking, or null
+    - cropW/cropH/vidW/vidH: dimensions for the export filter
+    - available: whether OpenCV is installed on the server
+    """
+    if not _OPENCV_AVAILABLE:
+        return {
+            "hasTracking": False,
+            "isStatic":    True,
+            "keyframes":   None,
+            "message":     "opencv-python-headless not installed — install it for motion tracking",
+            "available":   False,
+        }
+
+    suffix = Path(video.filename or "source.mp4").suffix or ".mp4"
+    tmp_path = TEMP_DIR / f"motion_{os.urandom(8).hex()}{suffix}"
+
+    try:
+        with tmp_path.open("wb") as f:
+            shutil.copyfileobj(video.file, f)
+
+        duration = end_time - start_time
+        if duration <= 0 or duration > 3600:
+            raise HTTPException(400, "Invalid clip duration (must be 0–3600s)")
+
+        print(f"🎯 Analyze motion: {aspect_ratio}, {start_time:.1f}s–{end_time:.1f}s")
+
+        # Run detection in thread pool to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: asyncio.run(analyze_video_motion(tmp_path, start_time, end_time, aspect_ratio))
+        )
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[analyze-motion error] {e}")
+        raise HTTPException(500, f"Motion analysis failed: {str(e)[:200]}")
     finally:
         safe_delete(tmp_path)
 
@@ -1230,8 +1613,6 @@ async def export_clip(
 
     img_temp_files: list[Path] = []
 
-    img_temp_files: list[Path] = []
-
     try:
         with upload_path.open("wb") as f:
             shutil.copyfileobj(video.file, f)
@@ -1245,15 +1626,25 @@ async def export_clip(
 
         text_overlays  = edits.get("textOverlays", [])
         image_overlays = edits.get("imageOverlays", [])
-        text_overlays  = edits.get("textOverlays", [])
-        image_overlays = edits.get("imageOverlays", [])
 
+        # ── Motion tracking ───────────────────────────────────────────────
+        motion_keyframes: Optional[list[dict]] = edits.get("motionKeyframes") or None
+        motion_vid_w: Optional[int] = edits.get("motionVidW")
+        motion_vid_h: Optional[int] = edits.get("motionVidH")
+
+        vid_info: Optional[dict] = None
+        if motion_keyframes and motion_vid_w and motion_vid_h:
+            vid_info = {"w": int(motion_vid_w), "h": int(motion_vid_h)}
+            print(f"🎯 Export with motion tracking: {len(motion_keyframes)} kf, "
+                  f"vid={motion_vid_w}x{motion_vid_h}")
+
+        # ── Resolve fonts for subtitle overlays ───────────────────────────
         resolved_fonts: dict[str, Optional[str]] = {}
         if DRAWTEXT_OK and text_overlays:
             print(f"🔤 Resolving fonts for {len(text_overlays)} text overlays…")
-            print(f"🔤 Resolving fonts for {len(text_overlays)} text overlays…")
             resolved_fonts = await resolve_fonts_for_overlays(text_overlays)
 
+        # ── Image overlays ────────────────────────────────────────────────
         valid_image_overlays: list[dict] = []
         for i, img in enumerate(image_overlays):
             src = img.get("src", "")
@@ -1267,11 +1658,17 @@ async def export_clip(
         has_text_overlays  = DRAWTEXT_OK and bool(text_overlays)
         has_image_overlays = bool(valid_image_overlays)
 
-        base_filters = build_ffmpeg_filters(edits, resolved_fonts)
+        base_filters = build_ffmpeg_filters(
+            edits,
+            resolved_fonts,
+            motion_keyframes=motion_keyframes,
+            vid_info=vid_info,
+        )
 
         print(
             f"🎬 Export start={start_sec:.1f}s dur={duration_sec:.1f}s "
-            f"text={len(text_overlays)} images={len(valid_image_overlays)}"
+            f"text={len(text_overlays)} images={len(valid_image_overlays)} "
+            f"motion={'yes' if motion_keyframes else 'no'}"
         )
 
         args = [
@@ -1314,13 +1711,12 @@ async def export_clip(
 
         args += [
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k",
             "-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "pipe:1",
         ]
 
-        use_buffered = has_image_overlays or has_text_overlays
+        use_buffered = has_image_overlays or has_text_overlays or bool(motion_keyframes)
         file_name    = f"clip_{int(start_sec)}_{int(start_sec + duration_sec)}.mp4"
 
         if use_buffered:
@@ -1335,15 +1731,10 @@ async def export_clip(
                 safe_delete(p)
             img_temp_files.clear()
 
-            for p in img_temp_files:
-                safe_delete(p)
-            img_temp_files.clear()
-
             if process.returncode != 0 or len(stdout_data) == 0:
                 err = stderr_data.decode("utf-8", errors="replace")
                 print(f"[ffmpeg error]\n{err[-800:]}")
                 safe_delete(upload_path)
-
 
                 hint = ""
                 if "No such file or directory" in err and "font" in err.lower():
@@ -1352,18 +1743,16 @@ async def export_clip(
                     hint = " (drawtext filter error)"
                 elif "scale2ref" in err.lower() or "overlay" in err.lower():
                     hint = " (image overlay filter error)"
-                elif "scale2ref" in err.lower() or "overlay" in err.lower():
-                    hint = " (image overlay filter error)"
+                elif "crop" in err.lower():
+                    hint = " (motion tracking crop error)"
                 raise HTTPException(500, f"ffmpeg failed{hint}: {err[-300:]}")
 
             safe_delete(upload_path)
             print(
                 f"✅ Export OK — {len(stdout_data):,} bytes "
-                f"(buffered, images={len(valid_image_overlays)}, dur={duration_sec:.1f}s)"
-            )
-            print(
-                f"✅ Export OK — {len(stdout_data):,} bytes "
-                f"(buffered, images={len(valid_image_overlays)}, dur={duration_sec:.1f}s)"
+                f"(buffered, images={len(valid_image_overlays)}, "
+                f"motion={'yes' if motion_keyframes else 'no'}, "
+                f"dur={duration_sec:.1f}s)"
             )
 
             async def yield_buffer():
@@ -1380,7 +1769,7 @@ async def export_clip(
             )
 
         else:
-            # Pure streaming — no overlays at all
+            # Pure streaming — no overlays or tracking
             process = await asyncio.create_subprocess_exec(
                 *args,
                 stdout=asyncio.subprocess.PIPE,
@@ -1409,12 +1798,7 @@ async def export_clip(
                             f"[ffmpeg error]\n"
                             f"{b''.join(stderr_buf).decode(errors='replace')[-500:]}"
                         )
-                        print(
-                            f"[ffmpeg error]\n"
-                            f"{b''.join(stderr_buf).decode(errors='replace')[-500:]}"
-                        )
                     else:
-                        print(f"✅ Export OK — {total:,} bytes (streaming, dur={duration_sec:.1f}s)")
                         print(f"✅ Export OK — {total:,} bytes (streaming, dur={duration_sec:.1f}s)")
                 finally:
                     safe_delete(upload_path)
@@ -1435,13 +1819,9 @@ async def export_clip(
         safe_delete(upload_path)
         for p in img_temp_files:
             safe_delete(p)
-        for p in img_temp_files:
-            safe_delete(p)
         raise
     except Exception as e:
         safe_delete(upload_path)
-        for p in img_temp_files:
-            safe_delete(p)
         for p in img_temp_files:
             safe_delete(p)
         print(f"[export exception] {e}")
