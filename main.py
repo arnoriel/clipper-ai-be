@@ -11,21 +11,22 @@ import base64 as b64
 import asyncio
 import tempfile
 import subprocess
-import yt_dlp
+import yt_dlp  # type: ignore
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any, List, Tuple
+import traceback
 
 # Load .env file (untuk development lokal)
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv  # type: ignore
     load_dotenv()
 except ImportError:
     pass
 
-import httpx
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+import httpx  # type: ignore
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException  # type: ignore
+from fastapi.middleware.cors import CORSMiddleware  # type: ignore
+from fastapi.responses import StreamingResponse  # type: ignore
 import shutil
 
 # ─── App ──────────────────────────────────────────────────────────────────────
@@ -52,6 +53,8 @@ OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")      # OpenAI Whisper (paid
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")        # Groq Whisper FREE ✅
 
 AI_MODELS = [
+    "google/gemini-2.5-flash:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
     "arcee-ai/trinity-large-preview:free",
 ]
 
@@ -188,7 +191,7 @@ async def resolve_google_font(
                     if ttf_url:
                         break
                     try:
-                        css_resp = await client.get(css_url, headers=headers)
+                        css_resp = await client.get(css_url, headers=headers)  # type: ignore
                         if not css_resp.is_success:
                             continue
 
@@ -208,7 +211,7 @@ async def resolve_google_font(
             if not ttf_url:
                 return SYSTEM_FONT
 
-            font_resp = await client.get(ttf_url, timeout=30.0)
+            font_resp = await client.get(ttf_url, timeout=30.0)  # type: ignore
             if not font_resp.is_success or len(font_resp.content) < 1000:
                 return SYSTEM_FONT
 
@@ -238,12 +241,12 @@ async def resolve_fonts_for_overlays(overlays: list[dict]) -> dict[str, Optional
 
     raw_results = await asyncio.gather(*coros, return_exceptions=True)
 
-    results: dict[str, Optional[str]] = {}
+    results: Dict[str, Optional[str]] = {}
     for oid, result in zip(ids, raw_results):
         if isinstance(result, Exception):
-            results[oid] = SYSTEM_FONT
+            results[oid] = SYSTEM_FONT  # type: ignore
         else:
-            results[oid] = result
+            results[oid] = result  # type: ignore
 
     return results
 
@@ -331,7 +334,7 @@ async def call_whisper_groq(audio_path: Path, language: Optional[str] = None) ->
         with open(audio_path, "rb") as f:
             audio_bytes = f.read()
 
-        data = {
+        data: Dict[str, str] = {
             "model":             "whisper-large-v3-turbo",
             "response_format":   "verbose_json",
             "timestamp_granularities[]": "word",
@@ -360,6 +363,7 @@ async def call_whisper_groq(audio_path: Path, language: Optional[str] = None) ->
             result["words"] = words
 
         return result
+    return {}
 
 
 async def call_whisper_openai(audio_path: Path, language: Optional[str] = None) -> dict:
@@ -369,7 +373,7 @@ async def call_whisper_openai(audio_path: Path, language: Optional[str] = None) 
         with open(audio_path, "rb") as f:
             audio_bytes = f.read()
 
-        data = {
+        data: Dict[str, str] = {
             "model":           "whisper-1",
             "response_format": "verbose_json",
             "timestamp_granularities[]": "word",
@@ -390,6 +394,7 @@ async def call_whisper_openai(audio_path: Path, language: Optional[str] = None) 
             raise HTTPException(502, f"Whisper API error {resp.status_code}: {resp.text[:300]}")
 
         return resp.json()
+    return {}
 
 
 def call_whisper_local(audio_path: Path, language: Optional[str] = None) -> dict:
@@ -447,12 +452,12 @@ async def call_whisper_api(audio_path: Path, language: Optional[str] = None) -> 
 
 
 def group_words_to_subtitles(
-    words: list[dict],
+    words: List[Dict[str, Any]],
     words_per_chunk: int = 3,
-) -> list[dict]:
+) -> List[Dict[str, Any]]:
     subtitles = []
     for i in range(0, len(words), words_per_chunk):
-        chunk = words[i : i + words_per_chunk]
+        chunk = words[i : i + words_per_chunk]  # type: ignore
         if not chunk:
             break
         text = " ".join(w.get("word", "").strip() for w in chunk).strip()
@@ -513,7 +518,8 @@ async def call_openrouter(
                     continue
 
                 if not resp.is_success:
-                    raise HTTPException(502, f"OpenRouter {resp.status_code}: {resp.text[:200]}")
+                    last_error = RuntimeError(f"OpenRouter {resp.status_code}: {resp.text[:200]}")
+                    break
 
                 content = resp.json()["choices"][0]["message"]["content"]
                 return content
@@ -535,9 +541,11 @@ async def call_openrouter(
                 last_error = e
                 break
 
+    err_msg = str(last_error)
+    err_slice = err_msg[:200] if len(err_msg) > 200 else err_msg  # type: ignore
     raise HTTPException(
         502,
-        f"Semua model AI gagal. Error: {type(last_error).__name__}: {str(last_error)[:200]}"
+        f"Semua model AI gagal. Error: {type(last_error).__name__}: {err_slice}"
     )
 
 
@@ -638,16 +646,18 @@ def build_ffmpeg_filters(
 
         font_path: Optional[str] = None
         if resolved_fonts:
-            font_path = resolved_fonts.get(overlay_id)
+            font_path = resolved_fonts.get(overlay_id)  # type: ignore
         if not font_path:
             font_path = SYSTEM_FONT
         if font_path:
             escaped_font_path = font_path.replace("\\", "\\\\").replace(":", "\\:")
+            # Inject emoji fallback via fontfile syntax (though natively ffmpeg fontconfig is tricky,
+            # supplying the primary font is the best strict method)
             font_part = f"fontfile='{escaped_font_path}':"
         else:
             font_part = ""
 
-        font_size_stored = float(t.get("fontSize", 36))
+        font_size_stored = float(t.get("fontSize", 40))  # type: ignore
         font_size_ratio  = font_size_stored / FONT_REFERENCE_WIDTH
         font_size_expr   = f"w*{font_size_ratio:.6f}"
 
@@ -691,7 +701,8 @@ def build_ffmpeg_filters(
         if outline_width > 0:
             outline_ratio = outline_width / FONT_REFERENCE_WIDTH
             border_color = hex_to_ffmpeg_color(outline_color_hex, 1.0)
-            border_part = f"borderw=w*{outline_ratio:.6f}:bordercolor={border_color}:"
+            # borderw does not support 'w' expression in all ffmpeg builds, evaluating to fixed float
+            border_part = f"borderw={outline_ratio * 1080:.1f}:bordercolor={border_color}:"
 
         shadow_enabled = t.get("shadowEnabled", True)
         shadow_part = ""
@@ -729,6 +740,166 @@ def build_ffmpeg_filters(
         filters.append(drawtext)
 
     return filters
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEXT OVERLAY → PNG (Pillow-based, supports Emoji)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Windows Segoe UI Emoji font — available by default on all Windows 10+ machines
+_EMOJI_FONT_WIN = "C:/Windows/Fonts/seguiemj.ttf"
+
+def _has_emoji(text: str) -> bool:
+    """Return True if `text` contains any Unicode emoji character."""
+    import unicodedata
+    for ch in text:
+        cat = unicodedata.category(ch)
+        cp  = ord(ch)
+        if cat in ("So", "Cn") or 0x1F000 <= cp <= 0x1FFFF or 0x2600 <= cp <= 0x27FF:
+            return True
+    return False
+
+
+def render_text_as_png(
+    t: dict,
+    font_path: Optional[str],
+    video_w: int,
+    video_h: int,
+    idx: int,
+) -> Optional[Path]:
+    """
+    Render a single text-overlay dict → transparent PNG using Pillow.
+    Returns the Path to the temp PNG, or None on failure.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont, ImageFilter  # type: ignore  # PIL installed via pip install Pillow
+        import math
+
+        raw_text   = t.get("text", "")
+        uppercase  = t.get("uppercase", False)
+        if uppercase:
+            raw_text = raw_text.upper()
+
+        font_size_stored = float(t.get("fontSize", 40))
+        # Scale font size proportionally to the actual video width
+        font_size_px = max(8, int(font_size_stored / FONT_REFERENCE_WIDTH * video_w))
+
+        # ── Pick best font ─────────────────────────────────────────────────────
+        # If text has emoji, prefer the Windows emoji font.
+        # Otherwise use the Google/system font the user chose.
+        use_emoji_font = _has_emoji(raw_text) and Path(_EMOJI_FONT_WIN).exists()
+        chosen_font_path = _EMOJI_FONT_WIN if use_emoji_font else (font_path or SYSTEM_FONT)
+
+        try:
+            pil_font = ImageFont.truetype(chosen_font_path or "", font_size_px)  # type: ignore
+        except Exception:
+            pil_font = ImageFont.load_default()  # type: ignore
+
+        # ── Create transparent canvas ──────────────────────────────────────────
+        canvas = Image.new("RGBA", (video_w, video_h), (0, 0, 0, 0))
+        draw   = ImageDraw.Draw(canvas)
+
+        # Measure text size
+        bbox = draw.textbbox((0, 0), raw_text, font=pil_font)  # type: ignore
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+
+        # ── Position ──────────────────────────────────────────────────────────
+        raw_x     = t.get("x")
+        raw_y     = t.get("y")
+        text_align = t.get("textAlign", "center")
+
+        if raw_x is None or abs(raw_x - 0.5) < 0.02:
+            if text_align == "left":
+                px = int(video_w * 0.02)
+            elif text_align == "right":
+                px = int(video_w * 0.98) - tw
+            else:
+                px = (video_w - tw) // 2
+        else:
+            raw_x_f = float(raw_x)  # type: ignore
+            if text_align == "left":
+                px = int(video_w * raw_x_f)
+            elif text_align == "right":
+                px = int(video_w * raw_x_f) - tw
+            else:
+                px = int(video_w * raw_x_f) - tw // 2
+
+        if raw_y is None or abs(float(raw_y or 0.5) - 0.5) < 0.02:
+            py = (video_h - th) // 2
+        else:
+            raw_y_f = float(raw_y)  # type: ignore
+            py = int(video_h * raw_y_f) - th // 2
+
+        # ── Colors ─────────────────────────────────────────────────────────────
+        opacity        = float(t.get("opacity", 1.0))
+        font_color_hex = t.get("color", "#FFFFFF")
+        hx = str(font_color_hex).lstrip("#")
+        if len(hx) == 3:
+            hx = "".join(c*2 for c in hx)
+        hx = (hx + "000000")[:6]  # type: ignore
+        r, g, b = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)  # type: ignore
+        a = int(opacity * 255)
+        fill_color = (r, g, b, a)
+
+        # ── Shadow ─────────────────────────────────────────────────────────────
+        shadow_enabled = t.get("shadowEnabled", True)
+        if shadow_enabled:
+            shadow_hex = t.get("shadowColor", "#000000")
+            sx = float(t.get("shadowX", 2))
+            sy = float(t.get("shadowY", 2))
+            shx = int(sx / FONT_REFERENCE_WIDTH * video_w)
+            shy = int(sy / FONT_REFERENCE_WIDTH * video_h)
+            shex = str(shadow_hex).lstrip("#")
+            if len(shex) == 3:
+                shex = "".join(c*2 for c in shex)
+            shex = (shex + "000000")[:6]  # type: ignore[index]
+            sr, sg, sb = int(shex[0:2], 16), int(shex[2:4], 16), int(shex[4:6], 16)  # type: ignore[index]
+            draw.text((px + shx, py + shy), raw_text, font=pil_font, fill=(sr, sg, sb, 180))  # type: ignore
+
+        # ── Outline (border) ─────────────────────────────────────────────────
+        outline_width = float(t.get("outlineWidth", 0))
+        if outline_width > 0:
+            out_px = max(1, int(outline_width / FONT_REFERENCE_WIDTH * video_w))
+            out_hex = str(t.get("outlineColor", "#000000")).lstrip("#")
+            if len(out_hex) == 3:
+                out_hex = "".join(c*2 for c in out_hex)
+            out_hex = (out_hex + "000000")[:6]  # type: ignore[index]
+            or_, og, ob = int(out_hex[0:2], 16), int(out_hex[2:4], 16), int(out_hex[4:6], 16)  # type: ignore[index]
+            out_px_n = -int(out_px)  # type: ignore
+            for dx in range(out_px_n, int(out_px) + 1):  # type: ignore
+                for dy in range(out_px_n, int(out_px) + 1):  # type: ignore
+                    if dx == 0 and dy == 0:
+                        continue
+                    draw.text((px + dx, py + dy), raw_text, font=pil_font, fill=(or_, og, ob, 255))  # type: ignore
+
+        # ── Background box ────────────────────────────────────────────────────
+        bg_enabled = t.get("backgroundEnabled", False)
+        if bg_enabled:
+            bg_hex = str(t.get("backgroundColor", "#000000")).lstrip("#")
+            if len(bg_hex) == 3:
+                bg_hex = "".join(c*2 for c in bg_hex)
+            bg_hex = (bg_hex + "000000")[:6]  # type: ignore[index]
+            br_, bgg, bb_ = int(bg_hex[0:2], 16), int(bg_hex[2:4], 16), int(bg_hex[4:6], 16)  # type: ignore[index]
+            bg_opacity = float(t.get("backgroundOpacity", 0.6))
+            bg_a       = int(bg_opacity * 255)
+            pad        = int(t.get("backgroundPadding", 10))
+            draw.rectangle(
+                [px - pad, py - pad, px + tw + pad, py + th + pad],
+                fill=(br_, bgg, bb_, bg_a),
+            )
+
+        # ── Draw final text ───────────────────────────────────────────────────
+        draw.text((px, py), raw_text, font=pil_font, fill=fill_color, embedded_color=True)  # type: ignore
+
+        # Save temp PNG
+        png_path = TEMP_DIR / f"text_overlay_{idx}_{os.urandom(4).hex()}.png"
+        canvas.save(str(png_path), "PNG")
+        return png_path
+
+    except Exception as e:
+        print(f"⚠️  render_text_as_png failed: {e}")
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1080,11 +1251,50 @@ async def export_clip(
         text_overlays  = edits.get("textOverlays", [])
         image_overlays = edits.get("imageOverlays", [])
 
-        # ── Resolve fonts ─────────────────────────────────────────────────────
+        # ── Detect video dimensions for Pillow text renderer ──────────────────
+        video_w, video_h = 576, 1024  # safe default for portrait video
+        try:
+            probe = subprocess.run(
+                [FFMPEG_BIN.replace("ffmpeg", "ffprobe"), "-v", "quiet",
+                 "-print_format", "json", "-show_streams", str(upload_path)],
+                capture_output=True, text=True, timeout=10
+            )
+            import json as _json
+            probe_data = _json.loads(probe.stdout)
+            for stream in probe_data.get("streams", []):
+                if stream.get("codec_type") == "video":
+                    video_w = int(stream.get("width", video_w))
+                    video_h = int(stream.get("height", video_h))
+                    break
+        except Exception as probe_err:
+            print(f"⚠️  ffprobe failed, using default dims: {probe_err}")
+
+        # ── Resolve fonts for drawtext (fallback only, Pillow handles emoji) ──
         resolved_fonts: dict[str, Optional[str]] = {}
         if DRAWTEXT_OK and text_overlays:
             print(f"🔤 Resolving fonts for {len(text_overlays)} text overlays…")
             resolved_fonts = await resolve_fonts_for_overlays(text_overlays)
+
+        # ── Render each text overlay as PNG via Pillow ────────────────────────
+        # This correctly handles emojis which drawtext cannot render.
+        text_png_overlays: list[dict] = []   # metadata same shape as image_overlays
+        for i, t in enumerate(text_overlays):
+            overlay_id = t.get("id", "")
+            font_path_for_t: Optional[str] = resolved_fonts.get(overlay_id) or SYSTEM_FONT  # type: ignore
+            png_path = render_text_as_png(t, font_path_for_t, video_w, video_h, i)
+            if png_path:
+                # Add png to track of temp files so it's cleaned up
+                img_temp_files.append(png_path)
+                # Make a pseudo-overlay record compatible with build_filter_complex_with_images
+                # x/y/w/h: we pass the full-frame PNG, overlay at (0,0)
+                text_png_overlays.append({
+                    "__png_path": str(png_path),
+                    "x": 0.0, "y": 0.0,
+                    "width": 1.0, "height": 1.0,
+                    "startSec": t.get("startSec"),
+                    "endSec":   t.get("endSec"),
+                    "opacity":  t.get("opacity", 1.0),
+                })
 
         # ── Decode image overlays to temp files ───────────────────────────────
         valid_image_overlays: list[dict] = []
@@ -1097,11 +1307,22 @@ async def export_clip(
                 img_temp_files.append(path)
                 valid_image_overlays.append(img)
 
-        has_text_overlays  = DRAWTEXT_OK and bool(text_overlays)
-        has_image_overlays = bool(valid_image_overlays)
+        # Duplicate image decode block removed — valid_image_overlays already built above
 
-        # ── Base video filters (crop / setsar / eq / speed / drawtext) ────────
-        base_filters = build_ffmpeg_filters(edits, resolved_fonts)
+        # ── Combine text-PNG overlays + image overlays (text PNGs rendered first)
+        all_image_overlays: list[dict]  = text_png_overlays + valid_image_overlays
+        all_img_paths: list[Path] = [
+            Path(o["__png_path"]) for o in text_png_overlays
+        ] + list(img_temp_files[:len(valid_image_overlays)])  # type: ignore[index]
+
+        has_image_overlays = bool(all_image_overlays)
+
+        # Remove text overlays from drawtext — Pillow PNGs replace them entirely
+        edits_without_text = dict(edits)
+        edits_without_text["textOverlays"] = []
+
+        # ── Base video filters (crop / setsar / eq / speed) — NO drawtext ─────
+        base_filters = build_ffmpeg_filters(edits_without_text, {})
 
         print(
             f"🎬 Export start={start_sec:.1f}s dur={duration_sec:.1f}s "
@@ -1145,8 +1366,8 @@ async def export_clip(
         ]
 
         if has_image_overlays:
-            # Each image needs its own -t INPUT option before -loop 1 -i img
-            for img_path in img_temp_files:
+            # Each image (including text PNGs) needs its own -t INPUT option before -loop 1 -i img
+            for img_path in all_img_paths:
                 args += [
                     "-loop", "1",
                     "-t",   seconds_to_ffmpeg(duration_sec),  # FIX: limit loop duration
@@ -1155,8 +1376,8 @@ async def export_clip(
 
             filter_complex, final_label = build_filter_complex_with_images(
                 base_filters,
-                valid_image_overlays,
-                img_temp_files,
+                all_image_overlays,
+                all_img_paths,
             )
 
             args += [
@@ -1189,24 +1410,27 @@ async def export_clip(
         ]
 
         # ── Execute ffmpeg ────────────────────────────────────────────────────
-        use_buffered = has_image_overlays or has_text_overlays
+        use_buffered = has_image_overlays  # Pillow PNG overlays replace has_text_overlays
         file_name    = f"clip_{int(start_sec)}_{int(start_sec + duration_sec)}.mp4"
 
         if use_buffered:
-            process = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout_data, stderr_data = await process.communicate()
+            def run_ffmpeg() -> Any:
+                return subprocess.run(args, capture_output=True)
+            
+            loop = asyncio.get_event_loop()
+            proc = await loop.run_in_executor(None, run_ffmpeg)  # type: ignore
+            stdout_data, stderr_data = proc.stdout, proc.stderr
 
             for p in img_temp_files:
                 safe_delete(p)
             img_temp_files.clear()
 
-            if process.returncode != 0 or len(stdout_data) == 0:
-                err = stderr_data.decode("utf-8", errors="replace")
-                print(f"[ffmpeg error]\n{err[-800:]}")
+            if proc.returncode != 0 or len(stdout_data) == 0:
+                err = ""
+                if stderr_data:
+                    err = stderr_data.decode("utf-8", errors="replace")
+                
+                print(f"[ffmpeg error]\n{err}")
                 safe_delete(upload_path)
 
                 hint = ""
@@ -1216,7 +1440,7 @@ async def export_clip(
                     hint = " (drawtext filter error)"
                 elif "scale2ref" in err.lower() or "overlay" in err.lower():
                     hint = " (image overlay filter error)"
-                raise HTTPException(500, f"ffmpeg failed{hint}: {err[-300:]}")
+                raise HTTPException(500, f"ffmpeg failed{hint}: {err}")
 
             safe_delete(upload_path)
             print(
@@ -1239,44 +1463,38 @@ async def export_clip(
 
         else:
             # Pure streaming — no overlays at all
-            process = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            stderr_buf: list[bytes] = []
-
-            async def drain_stderr():
-                assert process.stderr
-                while chunk := await process.stderr.read(4096):
-                    stderr_buf.append(chunk)
-
-            stderr_task = asyncio.ensure_future(drain_stderr())
-
-            async def stream_stdout():
+            def stream_ffmpeg():
+                proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 total = 0
                 try:
-                    while chunk := await process.stdout.read(65536):
-                        total += len(chunk)
+                    while True:
+                        if proc.stdout is None:
+                            break
+                        chunk = proc.stdout.read(65536)  # type: ignore
+                        if not chunk:
+                            break
+                        total = total + len(chunk)  # type: ignore
                         yield chunk
-                    await process.wait()
-                    await stderr_task
-                    if process.returncode != 0:
-                        print(
-                            f"[ffmpeg error]\n"
-                            f"{b''.join(stderr_buf).decode(errors='replace')[-500:]}"
-                        )
+                    proc.wait()
+                    if proc.returncode != 0:
+                        err = ""
+                        if proc.stderr is not None:
+                            err_raw = proc.stderr.read()  # type: ignore
+                            err = err_raw.decode("utf-8", errors="replace") if isinstance(err_raw, bytes) else str(err_raw)
+                        print(f"[ffmpeg error]\n{err}")
                     else:
                         print(f"✅ Export OK — {total:,} bytes (streaming, dur={duration_sec:.1f}s)")
                 finally:
+                    if proc.stdout is not None:
+                        proc.stdout.close()  # type: ignore
+                    if proc.stderr is not None:
+                        proc.stderr.close()  # type: ignore
+                    if proc.returncode is None:
+                        proc.kill()
                     safe_delete(upload_path)
-                    if process.returncode is None:
-                        process.kill()
-                    stderr_task.cancel()
 
             return StreamingResponse(
-                stream_stdout(),
+                stream_ffmpeg(),
                 media_type="video/mp4",
                 headers={
                     "X-File-Name":                  file_name,
@@ -1294,7 +1512,9 @@ async def export_clip(
         for p in img_temp_files:
             safe_delete(p)
         print(f"[export exception] {e}")
-        raise HTTPException(500, f"Export failed: {str(e)}")
+        with open("error.log", "w", encoding="utf-8") as errf:
+            traceback.print_exc(file=errf)
+        raise HTTPException(500, f"Export failed: [{e.__class__.__name__}] {str(e)}")
 
 
 # ─── GET /api/youtube-info ────────────────────────────────────────────────────
@@ -1458,9 +1678,99 @@ async def generate_subtitle(
         safe_delete(mp3_path)
 
 
+# ─── POST /api/auto-subtitle-emoji ───────────────────────────────────────────
+@app.post("/api/auto-subtitle-emoji")
+async def auto_subtitle_emoji(
+    video: UploadFile = File(...),
+    start_sec: float = Form(0.0),
+    duration: float = Form(...)
+):
+    upload_path = None
+    mp3_path = None
+    
+    try:
+        ext = Path(video.filename or "video.mp4").suffix
+        if not ext: ext = ".mp4"
+        upload_path = TEMP_DIR / f"vid_sub_emj_{os.urandom(8).hex()}{ext}"
+        
+        with upload_path.open("wb") as f:
+            shutil.copyfileobj(video.file, f)
+            
+        mp3_path = TEMP_DIR / f"aud_{os.urandom(8).hex()}.mp3"
+        print(f"🎙️  Extracting audio for emoji subtitle: start={start_sec}s, dur={duration}s")
+        success = await extract_audio_segment(upload_path, start_sec, duration, mp3_path)
+        
+        if not success:
+            raise HTTPException(500, "Gagal mengekstrak audio dari video referensi.")
+            
+        print("🤖 Menjalankan AI Whisper Subtitle...")
+        whisper_res = await call_whisper_api(mp3_path)
+        raw_words = whisper_res.get("words", [])
+        
+        if not raw_words:
+            return {"vtt": "WEBVTT\n\n00:00:00.000 --> 00:00:05.000\nTidak ada suara yang terdeteksi."}
+            
+        grouped = group_words_to_subtitles(raw_words, words_per_chunk=3)
+        
+        # Build strict JSON request for LLM to add emojis
+        prompt_chunks = []
+        for i, chunk in enumerate(grouped):
+            prompt_chunks.append({"id": i, "text": chunk["text"]})
+            
+        print("🤖 Menambahkan Emoji menggunakan LLM...")
+        sys_prompt = "Kamu adalah spesialis emoji. Tugasmu: analisis tiap baris subtitle dan pilih 1 atau 2 emoji paling cocok. Kembalikan HANYA JSON array dengan key 'results', berisi object dengan properti 'id' dan 'emoji'. JANGAN mengulangi teks aslinya, cukup kembalikan emojinya saja."
+        user_prompt = f"Analisis teks ini:\n{json.dumps(prompt_chunks)}\nBerikan response JSON."
+        
+        content = await call_openrouter(
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=2000,
+            temperature=0.4
+        )
+        
+        # Parse output safely
+        cleaned = re.sub(r"```json\s*|```\s*", "", content).strip()
+        emoji_map = {}
+        try:
+            parsed = json.loads(cleaned)
+            results = parsed.get("results", []) if isinstance(parsed, dict) else parsed
+            if isinstance(results, list):
+                for r in results:
+                    emoji_map[r.get("id")] = r.get("emoji", "")
+        except Exception as e:
+            print(f"Failed to parse emoji JSON: {e}")
+            # fallback to no emoji if parsing fails
+
+        vtt_lines = ["WEBVTT\n"]
+        for i, chunk in enumerate(grouped, 1):
+            t_start = _format_vtt_time(chunk["start"])
+            t_end = _format_vtt_time(chunk["end"])
+            
+            # Use emoji text if available and valid
+            emoji_str = emoji_map.get(i-1, "")
+            text = chunk["text"]
+            if emoji_str and isinstance(emoji_str, str) and len(emoji_str.strip()) > 0:
+                text = f"{text} {emoji_str.strip()}"
+                
+            vtt_lines.append(f"{i}\n{t_start} --> {t_end}\n{text}\n")
+            
+        return {"vtt": "\n".join(vtt_lines)}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[auto subtitle emoji error] {e}")
+        raise HTTPException(500, f"Gagal membuat subtitle emoji otomatis: {e}")
+    finally:
+        safe_delete(upload_path)
+        safe_delete(mp3_path)
+
+
 # ─── Run (dev) ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import uvicorn
+    import uvicorn  # type: ignore
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
