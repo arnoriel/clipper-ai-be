@@ -11,6 +11,7 @@ import base64 as b64
 import asyncio
 import tempfile
 import subprocess
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,7 @@ except ImportError:
 
 import httpx
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Depends
+from fastapi import File as FAFile, UploadFile as FAUploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -45,8 +47,60 @@ except ImportError:
     _OPENCV_AVAILABLE = False
     print("⚠️  OpenCV not available. Install: pip install opencv-python-headless")
 
+# ─── Pre-load OpenCV cascades at module level (OPTIMIZED) ─────────────────────
+# Menghindari load ulang CascadeClassifier di setiap request analyze-motion
+_FACE_CASCADE: Optional[object] = None
+_BODY_CASCADE: Optional[object] = None
+
+def _init_cascades():
+    global _FACE_CASCADE, _BODY_CASCADE
+    if _OPENCV_AVAILABLE and _FACE_CASCADE is None:
+        import cv2
+        _FACE_CASCADE = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        _BODY_CASCADE = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_upperbody.xml"
+        )
+        print("✅ OpenCV cascades pre-loaded")
+
+# ─── Global HTTP Client (OPTIMIZED) ──────────────────────────────────────────
+# Satu client dengan connection pooling untuk semua request ke Supabase,
+# OpenRouter, Google Fonts, Groq, OpenAI — menghindari TCP handshake ulang.
+_http_client: Optional[httpx.AsyncClient] = None
+
+def get_http_client() -> httpx.AsyncClient:
+    if _http_client is None:
+        raise RuntimeError("HTTP client belum diinisialisasi")
+    return _http_client
+
+# ─── Lifespan: startup & shutdown (OPTIMIZED) ────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: "FastAPI"):
+    global _http_client
+    # Startup
+    _http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, connect=10.0),
+        limits=httpx.Limits(
+            max_connections=20,
+            max_keepalive_connections=10,
+            keepalive_expiry=30,
+        ),
+        http2=False,  # HTTP/1.1 lebih reliable di free-tier proxy
+    )
+    _init_cascades()
+    print("✅ Global HTTP client started")
+    yield
+    # Shutdown
+    await _http_client.aclose()
+    print("✅ Global HTTP client closed")
+
 # ─── App ──────────────────────────────────────────────────────────────────────
-app = FastAPI(title="AI Viral Clipper Backend", version="3.3.0")
+app = FastAPI(
+    title="AI Viral Clipper Backend",
+    version="3.4.0",
+    lifespan=lifespan,
+)
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
@@ -98,19 +152,24 @@ pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 def _safe_password(plain: str) -> str:
     return hashlib.sha256(plain.encode("utf-8")).hexdigest()
 
-def hash_password(plain: str) -> str:
-    return pwd_ctx.hash(_safe_password(plain))
+# OPTIMIZED: bcrypt dijalankan di thread pool agar tidak memblok event loop
+# bcrypt.hash/verify memakan ~200–400ms sinkron — sangat merusak throughput FastAPI
+async def hash_password(plain: str) -> str:
+    safe = _safe_password(plain)
+    return await asyncio.to_thread(pwd_ctx.hash, safe)
 
-def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_ctx.verify(_safe_password(plain), hashed)
+async def verify_password(plain: str, hashed: str) -> bool:
+    safe = _safe_password(plain)
+    return await asyncio.to_thread(pwd_ctx.verify, safe, hashed)
 
 
-def create_access_token(user_id: str, email: str, name: str) -> str:
+def create_access_token(user_id: str, email: str, name: str, role: str = "user") -> str:
     expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
     payload = {
         "sub":   user_id,
         "email": email,
         "name":  name,
+        "role":  role,
         "exp":   expire,
         "iat":   datetime.now(timezone.utc),
     }
@@ -134,6 +193,15 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="Autentikasi diperlukan")
     return decode_token(credentials.credentials)
 
+def require_superadmin(
+    credentials: "Optional[HTTPAuthorizationCredentials]" = Depends(bearer_scheme),
+) -> dict:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Autentikasi diperlukan")
+    payload = decode_token(credentials.credentials)
+    if payload.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Akses superadmin diperlukan")
+    return payload
 
 # ─── Supabase REST helpers ────────────────────────────────────────────────────
 
@@ -147,11 +215,10 @@ def _supa_headers() -> dict:
         "Prefer":        "return=representation",
     }
 
-
+# OPTIMIZED: semua Supabase call sekarang pakai global client (tidak buat client baru)
 async def supa_find_user_by_email(email: str) -> Optional[dict]:
     url = f"{SUPABASE_URL}/rest/v1/users?email=eq.{quote(email)}&limit=1"
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url, headers=_supa_headers())
+    r = await get_http_client().get(url, headers=_supa_headers())
     if not r.is_success:
         raise HTTPException(502, f"Supabase error: {r.text[:200]}")
     rows = r.json()
@@ -159,20 +226,18 @@ async def supa_find_user_by_email(email: str) -> Optional[dict]:
 
 async def supa_find_users_by_email(email: str) -> list[dict]:
     url = f"{SUPABASE_URL}/rest/v1/users?email=eq.{quote(email)}&limit=10"
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url, headers=_supa_headers())
+    r = await get_http_client().get(url, headers=_supa_headers())
     if not r.is_success:
         raise HTTPException(502, f"Supabase error: {r.text[:200]}")
     return r.json() or []
 
-async def supa_create_user(name: str, email: str, password_hash: str) -> dict:
+async def supa_create_user(name: str, email: str, password_hash: str, role: str = "user") -> dict:
     url = f"{SUPABASE_URL}/rest/v1/users"
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.post(
-            url,
-            headers=_supa_headers(),
-            json={"name": name, "email": email, "password_hash": password_hash},
-        )
+    r = await get_http_client().post(
+        url,
+        headers=_supa_headers(),
+        json={"name": name, "email": email, "password_hash": password_hash, "role": role},
+    )
     if not r.is_success:
         detail = r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text
         if r.status_code in (409, 422) or "unique" in str(detail).lower():
@@ -180,6 +245,65 @@ async def supa_create_user(name: str, email: str, password_hash: str) -> dict:
         raise HTTPException(502, f"Supabase error: {str(detail)[:200]}")
     rows = r.json()
     return rows[0] if isinstance(rows, list) else rows
+
+async def supa_get_user_credits(user_id: str) -> int:
+    url = f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}&select=credits&limit=1"
+    r = await get_http_client().get(url, headers=_supa_headers())
+    if not r.is_success:
+        raise HTTPException(502, "Gagal mengambil data kredit")
+    rows = r.json()
+    return rows[0]["credits"] if rows else 0
+
+
+async def supa_deduct_credit(user_id: str) -> bool:
+    """
+    Atomically deduct 1 credit. Returns True if successful, False if
+    insufficient credits. Uses optimistic concurrency via credits=gt.0 filter.
+    """
+    # 1. Read current credits
+    url_read = f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}&select=credits&limit=1"
+    r = await get_http_client().get(url_read, headers=_supa_headers())
+    if not r.is_success:
+        return False
+    rows = r.json()
+    if not rows or rows[0]["credits"] <= 0:
+        return False
+
+    current = rows[0]["credits"]
+    # 2. Conditional update: only deduct if credits still == current (prevents race)
+    url_update = f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}&credits=eq.{current}"
+    headers = {**_supa_headers(), "Prefer": "return=representation"}
+    r = await get_http_client().patch(url_update, headers=headers, json={"credits": current - 1})
+    if not r.is_success:
+        return False
+    updated = r.json() if r.headers.get("content-type", "").startswith("application/json") else []
+    return len(updated) > 0
+
+
+async def supa_add_credits(user_id: str, amount: int) -> int:
+    url_read = f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}&select=credits&limit=1"
+    r = await get_http_client().get(url_read, headers=_supa_headers())
+    if not r.is_success or not r.json():
+        raise HTTPException(404, "User tidak ditemukan")
+    new_credits = r.json()[0]["credits"] + amount
+    url_update = f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}"
+    headers = {**_supa_headers(), "Prefer": "return=representation"}
+    r = await get_http_client().patch(url_update, headers=headers, json={"credits": new_credits})
+    if not r.is_success:
+        raise HTTPException(502, "Gagal update kredit")
+    return new_credits
+
+
+async def supa_get_all_users_admin() -> list[dict]:
+    url = (
+        f"{SUPABASE_URL}/rest/v1/users"
+        f"?select=id,name,email,credits,role,created_at,updated_at"
+        f"&order=created_at.desc"
+    )
+    r = await get_http_client().get(url, headers=_supa_headers())
+    if not r.is_success:
+        raise HTTPException(502, f"Supabase error: {r.text[:200]}")
+    return r.json() or []
 
 
 # ─── Auth Pydantic schemas ────────────────────────────────────────────────────
@@ -233,29 +357,37 @@ class SignInRequest(BaseModel):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/auth/signup")
-async def signup(body: SignUpRequest):
+async def signup(body: "SignUpRequest"):
     existing = await supa_find_user_by_email(body.email)
     if existing:
         raise HTTPException(409, "Email sudah terdaftar")
-    pw_hash = hash_password(body.password)
-    user    = await supa_create_user(body.name, body.email, pw_hash)
+    pw_hash = await hash_password(body.password)   # OPTIMIZED: async bcrypt
+    user    = await supa_create_user(body.name, body.email, pw_hash, role="user")
     token = create_access_token(
         user_id=str(user["id"]),
         email=user["email"],
         name=user["name"],
+        role=user.get("role", "user"),
     )
     return {
         "token": token,
-        "user":  {"id": user["id"], "name": user["name"], "email": user["email"]},
+        "user":  {
+            "id":      user["id"],
+            "name":    user["name"],
+            "email":   user["email"],
+            "role":    user.get("role", "user"),
+            "credits": user.get("credits", 10),
+        },
     }
 
 
 @app.post("/api/auth/signin")
-async def signin(body: SignInRequest):
+async def signin(body: "SignInRequest"):
     users = await supa_find_users_by_email(body.email)
     matched_user = None
     for user in users:
-        if verify_password(body.password, user.get("password_hash", "")):
+        # OPTIMIZED: async bcrypt verify
+        if await verify_password(body.password, user.get("password_hash", "")):
             matched_user = user
             break
     if not matched_user:
@@ -264,20 +396,106 @@ async def signin(body: SignInRequest):
         user_id=str(matched_user["id"]),
         email=matched_user["email"],
         name=matched_user["name"],
+        role=matched_user.get("role", "user"),
     )
     return {
         "token": token,
-        "user":  {"id": matched_user["id"], "name": matched_user["name"], "email": matched_user["email"]},
+        "user":  {
+            "id":      matched_user["id"],
+            "name":    matched_user["name"],
+            "email":   matched_user["email"],
+            "role":    matched_user.get("role", "user"),
+            "credits": matched_user.get("credits", 0),
+        },
     }
 
 
 @app.get("/api/auth/me")
 async def me(current_user: dict = Depends(get_current_user)):
+    credits = await supa_get_user_credits(current_user["sub"])
     return {
-        "id":    current_user["sub"],
-        "name":  current_user.get("name"),
-        "email": current_user.get("email"),
+        "id":      current_user["sub"],
+        "name":    current_user.get("name"),
+        "email":   current_user.get("email"),
+        "role":    current_user.get("role", "user"),
+        "credits": credits,
     }
+
+@app.get("/api/user/credits")
+async def get_credits(current_user: dict = Depends(get_current_user)):
+    credits = await supa_get_user_credits(current_user["sub"])
+    return {"credits": credits, "user_id": current_user["sub"]}
+
+class AddCreditsRequest(BaseModel):
+    amount: int
+    note: str = ""
+
+    @field_validator("amount")
+    @classmethod
+    def amount_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("Jumlah kredit harus > 0")
+        if v > 100_000:
+            raise ValueError("Jumlah kredit terlalu besar (maks. 100.000)")
+        return v
+
+
+@app.get("/api/admin/users")
+async def admin_list_users(admin: dict = Depends(require_superadmin)):
+    users = await supa_get_all_users_admin()
+    total_credits = sum(u.get("credits", 0) for u in users if u.get("role") != "superadmin")
+    regular_users = [u for u in users if u.get("role") != "superadmin"]
+    return {
+        "users": users,
+        "stats": {
+            "total_users":   len(regular_users),
+            "total_credits": total_credits,
+            "total_accounts": len(users),
+        },
+    }
+
+
+@app.post("/api/admin/users/{user_id}/add-credits")
+async def admin_add_user_credits(
+    user_id: str,
+    body: AddCreditsRequest,
+    admin: dict = Depends(require_superadmin),
+):
+    new_balance = await supa_add_credits(user_id, body.amount)
+    print(f"💰 Admin {admin['email']} added {body.amount} credits to {user_id}. "
+          f"New balance: {new_balance}. Note: {body.note or '-'}")
+    return {
+        "success":     True,
+        "user_id":     user_id,
+        "added":       body.amount,
+        "new_balance": new_balance,
+        "note":        body.note,
+    }
+
+
+@app.delete("/api/admin/users/{user_id}/credits")
+async def admin_set_user_credits(
+    user_id: str,
+    amount: int,
+    admin: dict = Depends(require_superadmin),
+):
+    url = f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}"
+    headers = {**_supa_headers(), "Prefer": "return=representation"}
+    r = await get_http_client().patch(url, headers=headers, json={"credits": max(0, amount)})
+    if not r.is_success:
+        raise HTTPException(502, "Gagal mengatur kredit")
+    return {"success": True, "user_id": user_id, "credits": max(0, amount)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# KEEP-ALIVE ENDPOINT (OPTIMIZED untuk Render free plan)
+# ══════════════════════════════════════════════════════════════════════════════
+# Daftarkan URL ini di UptimeRobot / cron-job.org setiap 14 menit agar
+# service tidak tertidur. Endpoint ini super ringan — hanya return JSON.
+
+@app.get("/api/ping")
+async def ping():
+    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -389,48 +607,45 @@ async def resolve_google_font(
     print(f"🔤 Downloading font: {font_family} ({variant})")
 
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=10.0),
-            follow_redirects=True,
-        ) as client:
-            ttf_url: Optional[str] = None
+        client = get_http_client()
+        ttf_url: Optional[str] = None
 
-            for ua in _TTF_USER_AGENTS:
+        for ua in _TTF_USER_AGENTS:
+            if ttf_url:
+                break
+            headers = {"User-Agent": ua}
+
+            for css_url in css_urls:
                 if ttf_url:
                     break
-                headers = {"User-Agent": ua}
-
-                for css_url in css_urls:
-                    if ttf_url:
-                        break
-                    try:
-                        css_resp = await client.get(css_url, headers=headers)
-                        if not css_resp.is_success:
-                            continue
-
-                        all_urls = re.findall(
-                            r"url\((https://fonts\.gstatic\.com/[^\)\"']+)\)",
-                            css_resp.text,
-                        )
-                        ttf_candidates = [u for u in all_urls if u.lower().endswith(".ttf")]
-
-                        if ttf_candidates:
-                            ttf_url = ttf_candidates[0]
-                            break
-
-                    except Exception:
+                try:
+                    css_resp = await client.get(css_url, headers=headers)
+                    if not css_resp.is_success:
                         continue
 
-            if not ttf_url:
-                return SYSTEM_FONT
+                    all_urls = re.findall(
+                        r"url\((https://fonts\.gstatic\.com/[^\)\"']+)\)",
+                        css_resp.text,
+                    )
+                    ttf_candidates = [u for u in all_urls if u.lower().endswith(".ttf")]
 
-            font_resp = await client.get(ttf_url, timeout=30.0)
-            if not font_resp.is_success or len(font_resp.content) < 1000:
-                return SYSTEM_FONT
+                    if ttf_candidates:
+                        ttf_url = ttf_candidates[0]
+                        break
 
-            local_path.write_bytes(font_resp.content)
-            _FONT_PATH_CACHE[cache_key] = str(local_path)
-            return str(local_path)
+                except Exception:
+                    continue
+
+        if not ttf_url:
+            return SYSTEM_FONT
+
+        font_resp = await client.get(ttf_url)
+        if not font_resp.is_success or len(font_resp.content) < 1000:
+            return SYSTEM_FONT
+
+        local_path.write_bytes(font_resp.content)
+        _FONT_PATH_CACHE[cache_key] = str(local_path)
+        return str(local_path)
 
     except Exception as e:
         print(f"❌ Font download exception for '{font_family}': {e}")
@@ -506,7 +721,6 @@ def save_image_overlay_to_temp(img_data_url: str, idx: int) -> Optional[Path]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _fill_kf_gaps(raw: list[dict], detected: list[dict]) -> list[dict]:
-    """Fill undetected frames by linear interpolation between detected ones."""
     result = []
     for kf in raw:
         if kf["detected"]:
@@ -532,11 +746,9 @@ def _fill_kf_gaps(raw: list[dict], detected: list[dict]) -> list[dict]:
 
 
 def _smooth_kf(keyframes: list[dict], alpha: float = 0.2) -> list[dict]:
-    """Bidirectional exponential smoothing for smooth camera movement."""
     if not keyframes:
         return keyframes
 
-    # Forward pass
     fwd = [{"t": keyframes[0]["t"], "cx": keyframes[0]["cx"], "cy": keyframes[0]["cy"]}]
     for kf in keyframes[1:]:
         fwd.append({
@@ -545,7 +757,6 @@ def _smooth_kf(keyframes: list[dict], alpha: float = 0.2) -> list[dict]:
             "cy": alpha * kf["cy"] + (1.0 - alpha) * fwd[-1]["cy"],
         })
 
-    # Backward pass
     bwd = list(reversed(fwd))
     for i in range(1, len(bwd)):
         bwd[i]["cx"] = alpha * bwd[i]["cx"] + (1.0 - alpha) * bwd[i - 1]["cx"]
@@ -555,7 +766,6 @@ def _smooth_kf(keyframes: list[dict], alpha: float = 0.2) -> list[dict]:
 
 
 def _decimate_kf(keyframes: list[dict], max_count: int = 80) -> list[dict]:
-    """Uniform sub-sampling to cap keyframe count."""
     if len(keyframes) <= max_count:
         return keyframes
     step = len(keyframes) / max_count
@@ -563,7 +773,6 @@ def _decimate_kf(keyframes: list[dict], max_count: int = 80) -> list[dict]:
 
 
 def _compute_crop_dimensions(vid_w: int, vid_h: int, aspect_ratio: str) -> tuple[int, int]:
-    """Compute pixel crop dimensions for a given aspect ratio string e.g. '9:16'."""
     ar_w, ar_h = [int(x) for x in aspect_ratio.split(":")]
     if vid_w / vid_h > ar_w / ar_h:
         crop_h = vid_h
@@ -583,10 +792,6 @@ def build_motion_tracking_crop(
     vid_w: int,
     vid_h: int,
 ) -> str:
-    """
-    Build ffmpeg crop=W:H:x_expr:y_expr with piecewise-linear keyframe interpolation.
-    keyframes: [{t, cx, cy}] — t in seconds, cx/cy normalized 0-1 (crop CENTER).
-    """
     max_x = max(0, vid_w - crop_w)
     max_y = max(0, vid_h - crop_h)
 
@@ -603,8 +808,6 @@ def build_motion_tracking_crop(
         return f"crop={crop_w}:{crop_h}:{to_px_x(keyframes[0])}:{to_px_y(keyframes[0])}"
 
     def build_axis_expr(get_px) -> str:
-        # Build nested if() from right to left for piecewise linear interpolation
-        # Commas inside if() escaped as \\, for ffmpeg filter arg parsing
         expr = str(get_px(keyframes[-1]))
 
         for i in range(len(keyframes) - 2, -1, -1):
@@ -624,7 +827,6 @@ def build_motion_tracking_crop(
 
             expr = f"if(lt(t\\,{t1})\\,{seg}\\,{expr})"
 
-        # Clamp: before first keyframe use first value
         t_first = round(keyframes[0]["t"], 3)
         p_first = get_px(keyframes[0])
         expr = f"if(lt(t\\,{t_first})\\,{p_first}\\,{expr})"
@@ -637,16 +839,17 @@ def build_motion_tracking_crop(
     return f"crop={crop_w}:{crop_h}:{x_expr}:{y_expr}"
 
 
-async def analyze_video_motion(
+# OPTIMIZED: fungsi ini sekarang murni sinkron agar aman dijalankan di thread pool
+# (tidak ada event loop baru di dalamnya — bug asyncio.run() sudah dihapus)
+def _analyze_video_motion_sync(
     video_path: Path,
     start_sec: float,
     end_sec: float,
     aspect_ratio: str,
 ) -> dict:
     """
-    Detect face/person movement in a video clip.
-    Returns keyframes for motion tracking, or a single static center point.
-    Requires: pip install opencv-python-headless
+    Versi sinkron dari analyze_video_motion — dijalankan via asyncio.to_thread().
+    Semua operasi OpenCV di sini adalah blocking I/O, sehingga harus di thread pool.
     """
     if not _OPENCV_AVAILABLE:
         return {
@@ -658,6 +861,14 @@ async def analyze_video_motion(
         }
 
     import cv2
+
+    # Gunakan cascade yang sudah di-preload (OPTIMIZED)
+    face_cascade = _FACE_CASCADE
+    body_cascade = _BODY_CASCADE
+    if face_cascade is None or body_cascade is None:
+        _init_cascades()
+        face_cascade = _FACE_CASCADE
+        body_cascade = _BODY_CASCADE
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -674,16 +885,7 @@ async def analyze_video_motion(
     vid_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     crop_w, crop_h = _compute_crop_dimensions(vid_w, vid_h, aspect_ratio)
 
-    # Load Haar cascades (bundled with OpenCV)
-    face_cascade  = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-    body_cascade  = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_upperbody.xml"
-    )
-
     duration     = max(end_sec - start_sec, 1.0)
-    # Sample at up to 2 fps; cap total samples at 120
     target_fps   = min(2.0, 120.0 / duration)
     frame_step   = max(1, int(fps / target_fps))
     start_frame  = int(start_sec * fps)
@@ -703,7 +905,6 @@ async def analyze_video_motion(
 
         t_sec = round((frame_idx - start_frame) / fps, 3)
 
-        # Downscale for speed (target max dim = 480px)
         scale = min(1.0, 480.0 / max(vid_w, vid_h, 1))
         if scale < 0.99:
             small = cv2.resize(frame, (int(vid_w * scale), int(vid_h * scale)))
@@ -713,7 +914,6 @@ async def analyze_video_motion(
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         cx, cy = None, None
 
-        # ── Face detection ──────────────────────────────────────────────────
         faces = face_cascade.detectMultiScale(
             gray,
             scaleFactor=1.15,
@@ -722,13 +922,10 @@ async def analyze_video_motion(
         )
 
         if len(faces) > 0:
-            # If multiple faces detected (podcast dual-speaker), pick the
-            # one with the largest area (most prominent / closest to camera)
             fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
             cx = (fx / scale + fw / scale / 2.0) / vid_w
             cy = (fy / scale + fh / scale / 2.0) / vid_h
         else:
-            # Fallback: upper-body detection for full-body movement videos
             bodies = body_cascade.detectMultiScale(
                 gray,
                 scaleFactor=1.1,
@@ -751,7 +948,6 @@ async def analyze_video_motion(
 
     cap.release()
 
-    # ── Evaluate detections ──────────────────────────────────────────────────
     detected     = [kf for kf in raw if kf["detected"]]
     detect_rate  = len(detected) / max(len(raw), 1)
     print(f"   Detected {len(detected)}/{len(raw)} frames ({detect_rate:.0%})")
@@ -767,7 +963,6 @@ async def analyze_video_motion(
             "available": True,
         }
 
-    # ── Fill gaps, smooth, check movement ────────────────────────────────────
     filled   = _fill_kf_gaps(raw, detected)
     smoothed = _smooth_kf(filled, alpha=0.25)
 
@@ -776,7 +971,7 @@ async def analyze_video_motion(
     cx_range = max(cx_vals) - min(cx_vals)
     cy_range = max(cy_vals) - min(cy_vals)
 
-    MOVEMENT_THRESHOLD = 0.06  # 6% of frame dimension
+    MOVEMENT_THRESHOLD = 0.06
 
     if cx_range < MOVEMENT_THRESHOLD and cy_range < MOVEMENT_THRESHOLD:
         avg_cx = sum(cx_vals) / len(cx_vals)
@@ -792,7 +987,6 @@ async def analyze_video_motion(
             "available": True,
         }
 
-    # ── Motion detected — decimate and return ────────────────────────────────
     final = _decimate_kf(smoothed, max_count=80)
     print(f"   → Motion tracking: {len(final)} keyframes, "
           f"cx_range={cx_range:.3f}, cy_range={cy_range:.3f}")
@@ -846,70 +1040,66 @@ def _whisper_available_provider() -> tuple[str, str]:
 
 async def call_whisper_groq(audio_path: Path, language: Optional[str] = None) -> dict:
     endpoint = "https://api.groq.com/openai/v1/audio/transcriptions"
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
-        with open(audio_path, "rb") as f:
-            audio_bytes = f.read()
+    data = {
+        "model":             "whisper-large-v3-turbo",
+        "response_format":   "verbose_json",
+        "timestamp_granularities[]": "word",
+    }
+    if language:
+        data["language"] = language
 
-        data = {
-            "model":             "whisper-large-v3-turbo",
-            "response_format":   "verbose_json",
-            "timestamp_granularities[]": "word",
-        }
-        if language:
-            data["language"] = language
+    print(f"   🟣 Using Groq Whisper (free) → {len(audio_bytes):,} bytes")
 
-        print(f"   🟣 Using Groq Whisper (free) → {len(audio_bytes):,} bytes")
+    resp = await get_http_client().post(
+        endpoint,
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        data=data,
+        files={"file": ("audio.mp3", audio_bytes, "audio/mpeg")},
+    )
 
-        resp = await client.post(
-            endpoint,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            data=data,
-            files={"file": ("audio.mp3", audio_bytes, "audio/mpeg")},
-        )
+    if not resp.is_success:
+        raise HTTPException(502, f"Groq Whisper error {resp.status_code}: {resp.text[:300]}")
 
-        if not resp.is_success:
-            raise HTTPException(502, f"Groq Whisper error {resp.status_code}: {resp.text[:300]}")
+    result = resp.json()
+    words = result.get("words", [])
+    if not words:
+        for seg in result.get("segments", []):
+            for w in seg.get("words", []):
+                words.append(w)
+        result["words"] = words
 
-        result = resp.json()
-        words = result.get("words", [])
-        if not words:
-            for seg in result.get("segments", []):
-                for w in seg.get("words", []):
-                    words.append(w)
-            result["words"] = words
-
-        return result
+    return result
 
 
 async def call_whisper_openai(audio_path: Path, language: Optional[str] = None) -> dict:
     endpoint = "https://api.openai.com/v1/audio/transcriptions"
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
-        with open(audio_path, "rb") as f:
-            audio_bytes = f.read()
+    data = {
+        "model":           "whisper-1",
+        "response_format": "verbose_json",
+        "timestamp_granularities[]": "word",
+    }
+    if language:
+        data["language"] = language
 
-        data = {
-            "model":           "whisper-1",
-            "response_format": "verbose_json",
-            "timestamp_granularities[]": "word",
-        }
-        if language:
-            data["language"] = language
+    print(f"   🔵 Using OpenAI Whisper → {len(audio_bytes):,} bytes")
 
-        print(f"   🔵 Using OpenAI Whisper → {len(audio_bytes):,} bytes")
+    resp = await get_http_client().post(
+        endpoint,
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        data=data,
+        files={"file": ("audio.mp3", audio_bytes, "audio/mpeg")},
+    )
 
-        resp = await client.post(
-            endpoint,
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            data=data,
-            files={"file": ("audio.mp3", audio_bytes, "audio/mpeg")},
-        )
+    if not resp.is_success:
+        raise HTTPException(502, f"Whisper API error {resp.status_code}: {resp.text[:300]}")
 
-        if not resp.is_success:
-            raise HTTPException(502, f"Whisper API error {resp.status_code}: {resp.text[:300]}")
-
-        return resp.json()
+    return resp.json()
 
 
 def call_whisper_local(audio_path: Path, language: Optional[str] = None) -> dict:
@@ -957,13 +1147,7 @@ async def call_whisper_api(audio_path: Path, language: Optional[str] = None) -> 
     elif provider == "openai":
         return await call_whisper_openai(audio_path, language)
     else:
-        loop = asyncio.get_event_loop()
-        try:
-            return await loop.run_in_executor(
-                None, call_whisper_local, audio_path, language
-            )
-        except RuntimeError as e:
-            raise HTTPException(500, str(e))
+        return await asyncio.to_thread(call_whisper_local, audio_path, language)
 
 
 def group_words_to_subtitles(
@@ -1005,24 +1189,21 @@ async def call_openrouter(
         for attempt in range(2):
             try:
                 print(f"🤖 model={model} attempt={attempt + 1}")
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(90.0, connect=15.0)
-                ) as client:
-                    resp = await client.post(
-                        f"{OPENROUTER_BASE}/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {key}",
-                            "Content-Type":  "application/json",
-                            "HTTP-Referer":  "https://viral-clipper-ai.vercel.app",
-                            "X-Title":       "AI Viral Clipper",
-                        },
-                        json={
-                            "model":       model,
-                            "messages":    messages,
-                            "max_tokens":  max_tokens,
-                            "temperature": temperature,
-                        },
-                    )
+                resp = await get_http_client().post(
+                    f"{OPENROUTER_BASE}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type":  "application/json",
+                        "HTTP-Referer":  "https://viral-clipper-ai.vercel.app",
+                        "X-Title":       "AI Viral Clipper",
+                    },
+                    json={
+                        "model":       model,
+                        "messages":    messages,
+                        "max_tokens":  max_tokens,
+                        "temperature": temperature,
+                    },
+                )
 
                 if resp.status_code == 429:
                     await asyncio.sleep(1)
@@ -1108,17 +1289,11 @@ def build_ffmpeg_filters(
     motion_keyframes: Optional[list[dict]] = None,
     vid_info: Optional[dict] = None,
 ) -> list[str]:
-    """
-    Build ffmpeg video filter list.
-    When motion_keyframes is provided together with vid_info and a non-original
-    aspect ratio, the static crop is replaced by a dynamic motion-tracking crop.
-    """
     filters: list[str] = []
 
     aspect_ratio = edits.get("aspectRatio", "original")
 
     if motion_keyframes and aspect_ratio and aspect_ratio != "original" and vid_info:
-        # ── Dynamic motion-tracking crop ──────────────────────────────────
         vid_w = int(vid_info.get("w", 1920))
         vid_h = int(vid_info.get("h", 1080))
         crop_w, crop_h = _compute_crop_dimensions(vid_w, vid_h, aspect_ratio)
@@ -1130,7 +1305,6 @@ def build_ffmpeg_filters(
         print(f"🎯 Motion crop: {crop_w}x{crop_h}, {len(motion_keyframes)} keyframes")
 
     elif aspect_ratio and aspect_ratio != "original":
-        # ── Static center crop ────────────────────────────────────────────
         rw, rh = [int(x) for x in aspect_ratio.split(":")]
         crop_w_expr = f"if(gt(iw/ih\\,{rw}/{rh})\\,trunc(ih*{rw}/{rh}/2)*2\\,iw)"
         crop_h_expr = f"if(gt(iw/ih\\,{rw}/{rh})\\,ih\\,trunc(iw*{rh}/{rw}/2)*2)"
@@ -1402,17 +1576,6 @@ async def analyze_motion_endpoint(
     end_time:     float      = Form(...),
     aspect_ratio: str        = Form(...),
 ):
-    """
-    Analyze a video clip for person/face motion to enable dynamic crop tracking.
-    Triggered automatically when the user selects any crop ratio ≠ 'original'.
-
-    Returns:
-    - hasTracking: whether significant movement was detected
-    - isStatic: person is present but not moving (single optimal crop center)
-    - keyframes: [{t, cx, cy}] for interpolated tracking, or null
-    - cropW/cropH/vidW/vidH: dimensions for the export filter
-    - available: whether OpenCV is installed on the server
-    """
     if not _OPENCV_AVAILABLE:
         return {
             "hasTracking": False,
@@ -1435,11 +1598,9 @@ async def analyze_motion_endpoint(
 
         print(f"🎯 Analyze motion: {aspect_ratio}, {start_time:.1f}s–{end_time:.1f}s")
 
-        # Run detection in thread pool to avoid blocking the event loop
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: asyncio.run(analyze_video_motion(tmp_path, start_time, end_time, aspect_ratio))
+        # OPTIMIZED: panggil fungsi sinkron via to_thread — tidak ada nested asyncio.run()
+        result = await asyncio.to_thread(
+            _analyze_video_motion_sync, tmp_path, start_time, end_time, aspect_ratio
         )
 
         return result
@@ -1459,16 +1620,19 @@ async def analyze_video(
     file_size: int   = Form(...),
     duration:  float = Form(...),
     mime_type: str   = Form(default="video/mp4"),
+    current_user: dict = Depends(get_current_user),
 ):
+    credits = await supa_get_user_credits(current_user["sub"])
+    if credits <= 0:
+        raise HTTPException(402, "Kredit tidak cukup. Silakan top up kredit kamu.")
+
     def fmt_time(s: float) -> str:
         h, rem = divmod(int(s), 3600)
         m, sec = divmod(rem, 60)
         return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
     file_size_mb = file_size / 1_048_576
-
     system_prompt = "Kamu adalah analis konten viral profesional. SELALU respons Bahasa Indonesia. Hanya JSON valid."
-
     user_prompt = f"""Analisis file video dan identifikasi 5-8 momen viral terbaik.
 
 INFO: nama={file_name}, ukuran={file_size_mb:.1f}MB, durasi={duration}s ({fmt_time(duration)}), format={mime_type}
@@ -1517,13 +1681,21 @@ JSON:
             "endTime":    min(end, int(duration)),
             "viralScore": max(1, min(10, m.get("viralScore", 5))),
         })
-
     moments.sort(key=lambda x: x["viralScore"], reverse=True)
-    return {
+
+    result = {
         "moments":             moments,
         "summary":             parsed.get("summary", "Analisis selesai."),
         "totalViralPotential": parsed.get("totalViralPotential", 5),
     }
+
+    deducted = await supa_deduct_credit(current_user["sub"])
+    remaining = await supa_get_user_credits(current_user["sub"])
+    result["credits_remaining"] = remaining
+    if deducted:
+        print(f"💳 Credit deducted: user={current_user['email']} | analyze-video | remaining={remaining}")
+
+    return result
 
 
 @app.post("/api/generate-clip-content")
@@ -1556,14 +1728,18 @@ JSON: {{"titles":["...","...","..."],"captions":["...dengan emoji","...singkat"]
 
 @app.post("/api/auto-subtitle")
 async def auto_subtitle(
-    video:      UploadFile = File(...),
-    start_time: float      = Form(...),
-    end_time:   float      = Form(...),
-    words_per_chunk: int   = Form(default=3),
-    language:   str        = Form(default=""),
+    video:      FAUploadFile = FAFile(...),
+    start_time: float        = Form(...),
+    end_time:   float        = Form(...),
+    words_per_chunk: int     = Form(default=3),
+    language:   str          = Form(default=""),
+    current_user: dict       = Depends(get_current_user),
 ):
-    provider, _ = _whisper_available_provider()
+    credits = await supa_get_user_credits(current_user["sub"])
+    if credits <= 0:
+        raise HTTPException(402, "Kredit tidak cukup. Silakan top up kredit kamu.")
 
+    provider, _ = _whisper_available_provider()
     duration = end_time - start_time
     if duration <= 0 or duration > 600:
         raise HTTPException(400, "Invalid clip duration (must be 0–600s)")
@@ -1576,7 +1752,8 @@ async def auto_subtitle(
         with upload_path.open("wb") as f:
             shutil.copyfileobj(video.file, f)
 
-        print(f"🎙️  Auto-subtitle: provider={provider} start={start_time:.1f}s dur={duration:.1f}s words_per_chunk={words_per_chunk}")
+        print(f"🎙️  Auto-subtitle: provider={provider} user={current_user['email']} "
+              f"start={start_time:.1f}s dur={duration:.1f}s words_per_chunk={words_per_chunk}")
 
         ok = await extract_audio_segment(upload_path, start_time, duration, audio_path)
         if not ok:
@@ -1584,19 +1761,22 @@ async def auto_subtitle(
 
         result = await call_whisper_api(audio_path, language=language or None)
         words  = result.get("words", [])
-
         print(f"   ✅ Transcribed {len(words)} words")
-
         chunks = group_words_to_subtitles(words, words_per_chunk=words_per_chunk)
 
-        return {
-            "ok":       True,
-            "chunks":   chunks,
-            "language": result.get("language", ""),
-            "full_text": result.get("text", ""),
-            "word_count": len(words),
-        }
+        deducted = await supa_deduct_credit(current_user["sub"])
+        remaining = await supa_get_user_credits(current_user["sub"])
+        if deducted:
+            print(f"💳 Credit deducted: user={current_user['email']} | auto-subtitle | remaining={remaining}")
 
+        return {
+            "ok":               True,
+            "chunks":           chunks,
+            "language":         result.get("language", ""),
+            "full_text":        result.get("text", ""),
+            "word_count":       len(words),
+            "credits_remaining": remaining,
+        }
     finally:
         safe_delete(upload_path)
         safe_delete(audio_path)
@@ -1627,7 +1807,6 @@ async def export_clip(
         text_overlays  = edits.get("textOverlays", [])
         image_overlays = edits.get("imageOverlays", [])
 
-        # ── Motion tracking ───────────────────────────────────────────────
         motion_keyframes: Optional[list[dict]] = edits.get("motionKeyframes") or None
         motion_vid_w: Optional[int] = edits.get("motionVidW")
         motion_vid_h: Optional[int] = edits.get("motionVidH")
@@ -1638,13 +1817,11 @@ async def export_clip(
             print(f"🎯 Export with motion tracking: {len(motion_keyframes)} kf, "
                   f"vid={motion_vid_w}x{motion_vid_h}")
 
-        # ── Resolve fonts for subtitle overlays ───────────────────────────
         resolved_fonts: dict[str, Optional[str]] = {}
         if DRAWTEXT_OK and text_overlays:
             print(f"🔤 Resolving fonts for {len(text_overlays)} text overlays…")
             resolved_fonts = await resolve_fonts_for_overlays(text_overlays)
 
-        # ── Image overlays ────────────────────────────────────────────────
         valid_image_overlays: list[dict] = []
         for i, img in enumerate(image_overlays):
             src = img.get("src", "")
@@ -1769,7 +1946,6 @@ async def export_clip(
             )
 
         else:
-            # Pure streaming — no overlays or tracking
             process = await asyncio.create_subprocess_exec(
                 *args,
                 stdout=asyncio.subprocess.PIPE,
