@@ -1706,24 +1706,32 @@ async def generate_clip_content(
     start_time:      float = Form(...),
     end_time:        float = Form(...),
     video_file_name: str   = Form(...),
+      current_user: dict     = Depends(get_current_user),   # ← tambah ini
 ):
+    # ── Credit check ──────────────────────────────────────────────────────
+    credits = await supa_get_user_credits(current_user["sub"])
+    if credits <= 0:
+        raise HTTPException(402, "Kredit tidak cukup. Silakan top up kredit kamu.")
+
     def fmt(s: float) -> str:
         m, sec = divmod(int(s), 60)
         return f"{m}:{sec:02d}"
 
-    prompt = f"""Buat konten media sosial Bahasa Indonesia untuk:
-Video: "{video_file_name}" | Klip: "{moment_label}" ({fmt(start_time)}-{fmt(end_time)}) | {moment_category}: {moment_reason}
+    prompt = f"""..."""  # tidak berubah
 
-JSON: {{"titles":["...","...","..."],"captions":["...dengan emoji","...singkat"],"hashtags":["#tag1","#tag2","#tag3","#tag4","#tag5"]}}"""
-
-    content = await call_openrouter(
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=800,
-        temperature=0.7,
-    )
+    content = await call_openrouter(...)  # tidak berubah
 
     cleaned = re.sub(r"```json\s*|```\s*", "", content).strip()
-    return json.loads(cleaned)
+    result = json.loads(cleaned)
+
+    # ── Deduct kredit SETELAH AI berhasil ─────────────────────────────────
+    deducted = await supa_deduct_credit(current_user["sub"])
+    remaining = await supa_get_user_credits(current_user["sub"])
+    if deducted:
+        print(f"💳 Credit deducted: user={current_user['email']} | generate-clip-content | remaining={remaining}")
+
+    result["credits_remaining"] = remaining
+    return result
 
 
 @app.post("/api/auto-subtitle")
@@ -1787,6 +1795,7 @@ async def export_clip(
     video:     UploadFile = File(...),
     clipJson:  str        = Form(...),
     editsJson: str        = Form(...),
+    current_user: dict    = Depends(get_current_user), 
 ):
     suffix      = Path(video.filename or "source.mp4").suffix or ".mp4"
     upload_path = TEMP_DIR / f"upload_{os.urandom(8).hex()}{suffix}"
