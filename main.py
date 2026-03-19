@@ -293,7 +293,6 @@ async def supa_add_credits(user_id: str, amount: int) -> int:
         raise HTTPException(502, "Gagal update kredit")
     return new_credits
 
-
 async def supa_get_all_users_admin() -> list[dict]:
     url = (
         f"{SUPABASE_URL}/rest/v1/users"
@@ -305,6 +304,53 @@ async def supa_get_all_users_admin() -> list[dict]:
         raise HTTPException(502, f"Supabase error: {r.text[:200]}")
     return r.json() or []
 
+async def supa_get_templates(user_id: str) -> list[dict]:
+    url = (
+        f"{SUPABASE_URL}/rest/v1/clip_templates"
+        f"?user_id=eq.{user_id}"
+        f"&order=updated_at.desc"
+    )
+    r = await get_http_client().get(url, headers=_supa_headers())
+    if not r.is_success:
+        raise HTTPException(502, f"Supabase error: {r.text[:200]}")
+    return r.json() or []
+ 
+ 
+async def supa_create_template(user_id: str, data: dict) -> dict:
+    url = f"{SUPABASE_URL}/rest/v1/clip_templates"
+    payload = {"user_id": user_id, **data}
+    r = await get_http_client().post(url, headers=_supa_headers(), json=payload)
+    if not r.is_success:
+        raise HTTPException(502, f"Supabase error: {r.text[:200]}")
+    rows = r.json()
+    return rows[0] if isinstance(rows, list) and rows else rows
+ 
+ 
+async def supa_update_template(template_id: str, user_id: str, data: dict) -> dict:
+    # Require user ownership via both id AND user_id in the filter
+    url = (
+        f"{SUPABASE_URL}/rest/v1/clip_templates"
+        f"?id=eq.{template_id}&user_id=eq.{user_id}"
+    )
+    payload = {**data, "updated_at": "now()"}
+    r = await get_http_client().patch(url, headers=_supa_headers(), json=payload)
+    if not r.is_success:
+        raise HTTPException(502, f"Supabase error: {r.text[:200]}")
+    rows = r.json()
+    if not rows:
+        raise HTTPException(404, "Template tidak ditemukan atau bukan milik kamu")
+    return rows[0] if isinstance(rows, list) else rows
+ 
+ 
+async def supa_delete_template(template_id: str, user_id: str) -> None:
+    url = (
+        f"{SUPABASE_URL}/rest/v1/clip_templates"
+        f"?id=eq.{template_id}&user_id=eq.{user_id}"
+    )
+    r = await get_http_client().delete(url, headers=_supa_headers())
+    if not r.is_success:
+        raise HTTPException(502, f"Supabase error: {r.text[:200]}")
+ 
 
 # ─── Auth Pydantic schemas ────────────────────────────────────────────────────
 
@@ -351,6 +397,58 @@ class SignInRequest(BaseModel):
     def email_lower(cls, v: str) -> str:
         return v.strip().lower()
 
+class TemplateCreate(BaseModel):
+    name: str
+    aspect_ratio: str = "original"
+    subtitle_preset_id: str = "bold-impact"
+    subtitle_enabled: bool = True
+    watermark_name: Optional[str] = None
+    watermark_x: float = 0.88
+    watermark_y: float = 0.06
+    watermark_width: float = 0.18
+    watermark_opacity: float = 0.85
+    brightness: float = 0.0
+    contrast: float = 0.0
+    saturation: float = 0.0
+    speed: float = 1.0
+
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Nama template tidak boleh kosong")
+        return v
+
+    @field_validator("aspect_ratio")
+    @classmethod
+    def valid_aspect_ratio(cls, v: str) -> str:
+        valid = {"original", "9:16", "16:9", "1:1", "4:3"}
+        if v not in valid:
+            raise ValueError(f"Aspect ratio tidak valid: {v}")
+        return v
+
+    @field_validator("speed")
+    @classmethod
+    def valid_speed(cls, v: float) -> float:
+        if v <= 0 or v > 4:
+            raise ValueError("Speed harus antara 0 dan 4")
+        return v
+
+
+@app.get("/api/admin/users")
+async def admin_list_users(admin: dict = Depends(require_superadmin)):
+    users = await supa_get_all_users_admin()
+    total_credits = sum(u.get("credits", 0) for u in users if u.get("role") != "superadmin")
+    regular_users = [u for u in users if u.get("role") != "superadmin"]
+    return {
+        "users": users,
+        "stats": {
+            "total_users":   len(regular_users),
+            "total_credits": total_credits,
+            "total_accounts": len(users),
+        },
+    }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTH ROUTES
@@ -426,6 +524,44 @@ async def get_credits(current_user: dict = Depends(get_current_user)):
     credits = await supa_get_user_credits(current_user["sub"])
     return {"credits": credits, "user_id": current_user["sub"]}
 
+@app.get("/api/templates")
+async def list_templates(current_user: dict = Depends(get_current_user)):
+    """Return all templates belonging to the authenticated user."""
+    templates = await supa_get_templates(current_user["sub"])
+    return {"templates": templates}
+ 
+ 
+@app.post("/api/templates")
+async def create_template(
+    body: TemplateCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    """Create a new template for the authenticated user."""
+    data = body.model_dump()
+    template = await supa_create_template(current_user["sub"], data)
+    return template
+ 
+ 
+@app.put("/api/templates/{template_id}")
+async def update_template(
+    template_id: str,
+    body: TemplateCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    """Update an existing template (must belong to the current user)."""
+    data = body.model_dump()
+    template = await supa_update_template(template_id, current_user["sub"], data)
+    return template
+ 
+@app.delete("/api/templates/{template_id}")
+async def delete_template(
+    template_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete a template (must belong to the current user)."""
+    await supa_delete_template(template_id, current_user["sub"])
+    return {"success": True, "id": template_id}
+
 class AddCreditsRequest(BaseModel):
     amount: int
     note: str = ""
@@ -438,21 +574,7 @@ class AddCreditsRequest(BaseModel):
         if v > 100_000:
             raise ValueError("Jumlah kredit terlalu besar (maks. 100.000)")
         return v
-
-
-@app.get("/api/admin/users")
-async def admin_list_users(admin: dict = Depends(require_superadmin)):
-    users = await supa_get_all_users_admin()
-    total_credits = sum(u.get("credits", 0) for u in users if u.get("role") != "superadmin")
-    regular_users = [u for u in users if u.get("role") != "superadmin"]
-    return {
-        "users": users,
-        "stats": {
-            "total_users":   len(regular_users),
-            "total_credits": total_credits,
-            "total_accounts": len(users),
-        },
-    }
+    
 
 
 @app.post("/api/admin/users/{user_id}/add-credits")
