@@ -3,19 +3,30 @@ services:
     name: clipper-ai-be
     runtime: docker
     dockerfilePath: ./Dockerfile
-
-    # Health check — Render pingnya ke sini setelah deploy untuk verifikasi
-    # Gunakan /api/ping yang super ringan (tidak ada DB call)
     healthCheckPath: /api/ping
 
     envVars:
       - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
         sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: JWT_SECRET
+        sync: false
+      - key: YT_PROXY_HOST
+        sync: false
+      - key: YT_PROXY_PORT
+        sync: false
+      - key: YT_PROXY_USER
+        sync: false
+      - key: YT_PROXY_PASS
+        sync: false
+      - key: YT_COOKIES_B64
         sync: false
       - key: ALLOWED_ORIGINS
         value: "http://localhost:5173,https://viral-clipper-ai.vercel.app"

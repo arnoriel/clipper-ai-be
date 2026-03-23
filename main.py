@@ -35,7 +35,6 @@ from pydantic import BaseModel, field_validator
 import shutil
 
 # Auth deps — pip install passlib[bcrypt] python-jose[cryptography]
-from passlib.context import CryptContext
 from jose import JWTError, jwt
 
 # ─── OpenCV availability check ────────────────────────────────────────────────
@@ -146,21 +145,27 @@ _FONT_PATH_CACHE: dict[str, str] = {}
 # AUTH UTILITIES
 # ══════════════════════════════════════════════════════════════════════════════
 
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+import bcrypt as _bcrypt
 
+def _safe_password(plain: str) -> bytes:
+    # SHA-256 → 32 bytes binary, jauh di bawah limit 72 bytes bcrypt
+    return hashlib.sha256(plain.encode("utf-8")).digest()
 
-def _safe_password(plain: str) -> str:
-    return hashlib.sha256(plain.encode("utf-8")).hexdigest()
-
-# OPTIMIZED: bcrypt dijalankan di thread pool agar tidak memblok event loop
-# bcrypt.hash/verify memakan ~200–400ms sinkron — sangat merusak throughput FastAPI
 async def hash_password(plain: str) -> str:
     safe = _safe_password(plain)
-    return await asyncio.to_thread(pwd_ctx.hash, safe)
+    hashed = await asyncio.to_thread(
+        _bcrypt.hashpw, safe, _bcrypt.gensalt(12)
+    )
+    return hashed.decode("utf-8")
 
 async def verify_password(plain: str, hashed: str) -> bool:
     safe = _safe_password(plain)
-    return await asyncio.to_thread(pwd_ctx.verify, safe, hashed)
+    try:
+        return await asyncio.to_thread(
+            _bcrypt.checkpw, safe, hashed.encode("utf-8")
+        )
+    except Exception:
+        return False
 
 
 def create_access_token(user_id: str, email: str, name: str, role: str = "user") -> str:

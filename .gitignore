@@ -7,5 +7,7 @@ venv/
 dist/
 *.egg-info/
 .DS_Store
-
+# yt_cookies.txt
+__pycache__/
+*.pyc
 .env
