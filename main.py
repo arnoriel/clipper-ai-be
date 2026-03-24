@@ -599,6 +599,37 @@ async def admin_add_user_credits(
         "note":        body.note,
     }
 
+class SetCreditsRequest(BaseModel):
+    amount: int
+
+    @field_validator("amount")
+    @classmethod
+    def amount_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("Jumlah kredit tidak boleh negatif")
+        if v > 1_000_000:
+            raise ValueError("Jumlah kredit terlalu besar (maks. 1.000.000)")
+        return v
+
+
+@app.patch("/api/admin/users/{user_id}/set-credits")
+async def admin_set_user_credits_patch(
+    user_id: str,
+    body: SetCreditsRequest,
+    admin: dict = Depends(require_superadmin),
+):
+    url = f"{SUPABASE_URL}/rest/v1/users?id=eq.{user_id}"
+    headers = {**_supa_headers(), "Prefer": "return=representation"}
+    r = await get_http_client().patch(url, headers=headers, json={"credits": body.amount})
+    if not r.is_success:
+        raise HTTPException(502, "Gagal mengatur kredit")
+    rows = r.json()
+    if not rows:
+        raise HTTPException(404, "User tidak ditemukan")
+    print(
+        f"✏️  Admin {admin['email']} SET credits of {user_id} → {body.amount}"
+    )
+    return {"success": True, "user_id": user_id, "new_balance": body.amount}
 
 @app.delete("/api/admin/users/{user_id}/credits")
 async def admin_set_user_credits(
