@@ -103,7 +103,7 @@ app = FastAPI(
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "http://localhost:5173,https://viral-clipper-ai.vercel.app"
+    "http://localhost:5173,https://viral-clipper-ai.vercel.app,https://ai.cuanclip.com"
 ).split(",")
 
 app.add_middleware(
