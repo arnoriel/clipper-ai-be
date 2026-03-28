@@ -1547,7 +1547,7 @@ def build_ffmpeg_filters(
         start_sec = t.get("startSec")
         end_sec   = t.get("endSec")
         if start_sec is not None and end_sec is not None:
-            enable = f":enable='gte(t\\,{start_sec:.3f})*lte(t\\,{end_sec:.3f})'"
+            enable = f":enable=between(t\\,{start_sec:.3f}\\,{end_sec:.3f})"
 
         outline_width = float(t.get("outlineWidth", 0))
         outline_color_hex = t.get("outlineColor", "#000000")
@@ -2064,6 +2064,7 @@ async def export_clip(
         file_name    = f"clip_{int(start_sec)}_{int(start_sec + duration_sec)}.mp4"
 
         if use_buffered:
+            print(f"[ffmpeg cmd] {' '.join(str(a) for a in args)}")
             process = await asyncio.create_subprocess_exec(
                 *args,
                 stdout=asyncio.subprocess.PIPE,
