@@ -122,7 +122,7 @@ OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
 
 AI_MODELS = [
-    "arcee-ai/trinity-large-preview:free",
+    "qwen/qwen3.6-plus-preview:free",
 ]
 
 # ─── Supabase / Auth Config ───────────────────────────────────────────────────
@@ -1778,8 +1778,10 @@ async def analyze_video(
     file_size: int   = Form(...),
     duration:  float = Form(...),
     mime_type: str   = Form(default="video/mp4"),
+    num_clips: int   = Form(default=5),
     current_user: dict = Depends(get_current_user),
 ):
+    num_clips = max(1, min(7, num_clips))  # clamp 1–7
     credits = await supa_get_user_credits(current_user["sub"])
     if credits <= 0:
         raise HTTPException(402, "Kredit tidak cukup. Silakan top up kredit kamu.")
@@ -1791,19 +1793,23 @@ async def analyze_video(
 
     file_size_mb = file_size / 1_048_576
     system_prompt = "Kamu adalah analis konten viral profesional. SELALU respons Bahasa Indonesia. Hanya JSON valid."
-    user_prompt = f"""Analisis file video dan identifikasi 5-8 momen viral terbaik.
+    user_prompt = f"""Analisis file video dan identifikasi TEPAT {num_clips} momen viral terbaik yang paling berpotensi viral di media sosial.
 
 INFO: nama={file_name}, ukuran={file_size_mb:.1f}MB, durasi={duration}s ({fmt_time(duration)}), format={mime_type}
 
-Distribusi merata:
-- 0-{duration*0.2:.0f}s (intro)
-- {duration*0.2:.0f}-{duration*0.4:.0f}s
-- {duration*0.4:.0f}-{duration*0.6:.0f}s
-- {duration*0.6:.0f}-{duration*0.8:.0f}s
-- {duration*0.8:.0f}-{duration}s (outro)
+Distribusi merata di seluruh video:
+- 0-{duration*0.25:.0f}s (bagian awal)
+- {duration*0.25:.0f}-{duration*0.5:.0f}s (bagian tengah awal)
+- {duration*0.5:.0f}-{duration*0.75:.0f}s (bagian tengah akhir)
+- {duration*0.75:.0f}-{duration}s (bagian akhir)
 
-Aturan: integer detik, durasi 15-90s, tidak overlap, tidak melebihi {duration}s.
-Kategori: funny/emotional/educational/shocking/satisfying/drama/highlight
+Aturan WAJIB:
+- Kembalikan TEPAT {num_clips} momen, tidak lebih tidak kurang
+- Gunakan integer detik, durasi 15-90s per clip
+- Tidak boleh overlap antar momen
+- Tidak melebihi {duration}s
+- Pilih momen dengan viralScore tertinggi
+- Kategori: funny/emotional/educational/shocking/satisfying/drama/highlight
 
 JSON:
 {{"summary":"...","totalViralPotential":7,"moments":[{{"id":"moment_1","label":"...","startTime":10,"endTime":55,"reason":"...","viralScore":8,"category":"highlight"}}]}}"""
@@ -1840,6 +1846,7 @@ JSON:
             "viralScore": max(1, min(10, m.get("viralScore", 5))),
         })
     moments.sort(key=lambda x: x["viralScore"], reverse=True)
+    moments = moments[:num_clips]  # Enforce exact count requested by user
 
     result = {
         "moments":             moments,
