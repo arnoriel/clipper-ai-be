@@ -29,7 +29,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source code (layer ini sering berubah, taruh paling akhir)
-COPY main.py .
+COPY . .
 
 # Pre-create direktori temp & font cache agar tidak perlu dibuat saat startup
 RUN mkdir -p /tmp/clipper-ai/fonts
