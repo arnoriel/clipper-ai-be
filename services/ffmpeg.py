@@ -149,22 +149,54 @@ except ImportError:
     _PIL_OK = False
     print("⚠️  Pillow not installed — vignette PNG disabled")
 
-_VIG_POWER    = 1.6
-_VIG_STRENGTH = 0.88
-
 # Cache PNG per resolusi agar tidak di-regenerate setiap export
 _VIGNETTE_PNG_CACHE: dict[tuple[int, int], Path] = {}
 
 
 def _make_vignette_array(width: int, height: int) -> "_np.ndarray":
-    """Generate RGBA numpy array untuk vignette — alpha=0 di tengah, naik ke tepi."""
+    """
+    Generate RGBA numpy array untuk vintage cinematic frame overlay.
+
+    Karakteristik:
+      - Sudut & tepi frame sangat gelap (hitam)
+      - Transisi lembut dari gelap ke transparan menuju tengah
+      - Sedikit inner glow (putih lembut) tepat di tepi dalam frame
+      - Box-SDF shape: lebih rectangular, cocok semua aspect ratio
+
+    RGB = hitam frame + sedikit putih untuk inner glow
+    Alpha = 0 (transparan di tengah), naik ke 255 (hitam di tepi)
+    """
     xs = _np.linspace(-1, 1, width,  dtype=_np.float32)
     ys = _np.linspace(-1, 1, height, dtype=_np.float32)
     xg, yg = _np.meshgrid(xs, ys)
-    dist   = _np.sqrt(xg**2 + yg**2) / _np.sqrt(2)           # 0=tengah, 1=sudut
-    alpha  = _np.clip(dist ** _VIG_POWER * _VIG_STRENGTH, 0, 1)
-    arr    = _np.zeros((height, width, 4), dtype=_np.uint8)
-    arr[:, :, 3] = (alpha * 255).astype(_np.uint8)            # alpha saja, RGB=0 (hitam)
+
+    # Inner transparent area (box SDF)
+    inner_x  = 0.78   # 78% lebar = area transparan
+    inner_y  = 0.76   # 76% tinggi = area transparan
+    softness = 0.18   # lebar zona transisi
+
+    sdx      = _np.abs(xg) - inner_x
+    sdy      = _np.abs(yg) - inner_y
+    box_dist = _np.maximum(sdx, sdy)   # >0 = luar (frame), <0 = dalam (transparan)
+
+    raw_alpha = _np.clip(box_dist / softness, 0, 1)
+
+    # Boost sudut supaya gelap lebih kuat di corner (cinematic feel)
+    corner_boost = (_np.abs(xg) * _np.abs(yg)) ** 0.45
+    frame_alpha  = _np.clip(raw_alpha + corner_boost * 0.12, 0, 1)
+    # Slight base opacity: tepi video tidak pernah 100% terang
+    frame_alpha  = _np.clip(frame_alpha * 0.97 + 0.03, 0, 1)
+
+    # Inner glow: kilat putih lembut di batas dalam frame
+    norm_dist = box_dist / softness
+    glow_band = _np.clip(1 - _np.abs(norm_dist - 0.05) * 6, 0, 1)
+    glow_rgb  = (_np.clip(glow_band * 0.22 * (1 - frame_alpha), 0, 1) * 255).astype(_np.uint8)
+
+    arr = _np.zeros((height, width, 4), dtype=_np.uint8)
+    arr[:, :, 0] = glow_rgb
+    arr[:, :, 1] = glow_rgb
+    arr[:, :, 2] = glow_rgb
+    arr[:, :, 3] = (frame_alpha * 255).astype(_np.uint8)
     return arr
 
 
@@ -183,14 +215,14 @@ def get_vignette_png_path(width: int = 1920, height: int = 1080) -> Optional[Pat
         if cached.exists():
             return cached
 
-    path = TEMP_DIR / f"vignette_{width}x{height}.png"
+    path = TEMP_DIR / f"cinematic_frame_{width}x{height}.png"
 
     if not (path.exists() and path.stat().st_size > 1000):
         try:
             arr = _make_vignette_array(width, height)
             img = _PILImage.fromarray(arr, mode="RGBA")
             img.save(str(path), format="PNG", compress_level=1)  # level 1 = fastest write
-            print(f"🎞️  Vignette PNG generated: {path.name} ({path.stat().st_size:,} bytes)")
+            print(f"🎞️  Cinematic frame PNG generated: {path.name} ({path.stat().st_size:,} bytes)")
         except Exception as ex:
             print(f"⚠️  Vignette PNG generation failed: {ex}")
             return None
