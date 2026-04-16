@@ -307,11 +307,83 @@ def build_intro_text_filter(
         f"text=\'{safe}\':"
         f"fontsize={font_size_expr}:"
         f"fontcolor=0xFFFFFFFF:"
-        f"borderw=w*0.004:"
+        f"borderw={max(1, round(FONT_REFERENCE_WIDTH * 0.004))}:"
         f"bordercolor=0x000000FF:"
         f"x=(w-text_w)/2:y={y_expr}:"
         f"alpha=\'{alpha_expr}\':"
         f"enable=\'{enable_expr}\'"
+    )
+    filters.append(main_f)
+
+    return filters
+
+
+def build_watermark_text_filter(
+    text: str,
+    font_path: Optional[str],
+    x: float = 0.88,
+    y: float = 0.06,
+    opacity: float = 0.85,
+    font_size_ratio: float = 0.04,
+    color: str = "#FFFFFF",
+    bold: bool = False,
+    italic: bool = False,
+) -> list[str]:
+    """
+    Render a persistent text watermark overlay on the video.
+    Always visible (no enable/disable time window).
+    Returns a list of drawtext filter strings (shadow + main).
+    """
+    if not text or not text.strip():
+        return []
+
+    safe = escape_drawtext(text.strip())
+
+    if font_path:
+        escaped_fp = font_path.replace("\\", "\\\\").replace(":", "\\:")
+        font_part = f"fontfile='{escaped_fp}':"
+    else:
+        font_part = ""
+
+    font_size_expr = f"w*{font_size_ratio:.6f}"
+
+    # X / Y anchored to percentage of frame
+    x_expr = f"w*{x:.4f}-text_w/2"
+    y_expr = f"h*{y:.4f}-text_h/2"
+
+    font_color = hex_to_ffmpeg_color(color, opacity)
+
+    # bold / italic via style string not directly supported in drawtext;
+    # handled by choosing bold/italic variant font file (resolved upstream).
+    # We do add a slight outline for legibility on any background.
+    outline_color = hex_to_ffmpeg_color("#000000", min(opacity, 0.7))
+
+    filters: list[str] = []
+
+    # Shadow pass
+    shadow_f = (
+        f"drawtext="
+        f"{font_part}"
+        f"text='{safe}':"
+        f"fontsize={font_size_expr}:"
+        f"fontcolor=0x00000077:"
+        f"x={x_expr}+2:y={y_expr}+2"
+    )
+    filters.append(shadow_f)
+
+    # Main text
+    # NOTE: borderw does NOT support expressions like w*0.002 — only fixed int pixels.
+    # We derive a reasonable pixel value from FONT_REFERENCE_WIDTH (1080px baseline).
+    border_px = max(1, round(FONT_REFERENCE_WIDTH * 0.002))  # ~2px at 1080p
+    main_f = (
+        f"drawtext="
+        f"{font_part}"
+        f"text='{safe}':"
+        f"fontsize={font_size_expr}:"
+        f"fontcolor={font_color}:"
+        f"borderw={border_px}:"
+        f"bordercolor={outline_color}:"
+        f"x={x_expr}:y={y_expr}"
     )
     filters.append(main_f)
 
@@ -325,6 +397,7 @@ def build_ffmpeg_filters(
     vid_info: Optional[dict] = None,
     intro_text: Optional[str] = None,
     intro_font_path: Optional[str] = None,
+    watermark_text_font_path: Optional[str] = None,
 ) -> list[str]:
     from services.motion import build_motion_tracking_crop, _compute_crop_dimensions  # local import avoids circular
 
@@ -435,7 +508,9 @@ def build_ffmpeg_filters(
         if outline_width > 0:
             outline_ratio = outline_width / FONT_REFERENCE_WIDTH
             border_color  = hex_to_ffmpeg_color(outline_color_hex, 1.0)
-            border_part   = f"borderw=w*{outline_ratio:.6f}:bordercolor={border_color}:"
+            # borderw does NOT support w* expressions — must be a fixed integer in pixels
+            border_px     = max(1, round(outline_ratio * FONT_REFERENCE_WIDTH))
+            border_part   = f"borderw={border_px}:bordercolor={border_color}:"
 
         shadow_enabled = t.get("shadowEnabled", True)
         if shadow_enabled:
@@ -476,6 +551,25 @@ def build_ffmpeg_filters(
         intro_filters = build_intro_text_filter(intro_text, intro_font_path, aspect_ratio)
         filters.extend(intro_filters)
         print(f"📝 Intro text: '{intro_text[:40]}' ({len(intro_filters)} layers)")
+
+    # ── Text watermark (persistent, always visible) ──────────────────────────
+    wm_type = edits.get("watermarkType", "image")
+    if DRAWTEXT_OK and wm_type == "text":
+        wm_text = edits.get("watermarkText", "") or ""
+        if wm_text.strip():
+            wm_filters = build_watermark_text_filter(
+                text=wm_text,
+                font_path=watermark_text_font_path,
+                x=float(edits.get("watermarkX", 0.88)),
+                y=float(edits.get("watermarkY", 0.06)),
+                opacity=float(edits.get("watermarkOpacity", 0.85)),
+                font_size_ratio=float(edits.get("watermarkFontSize", 0.04)),
+                color=edits.get("watermarkTextColor", "#FFFFFF"),
+                bold=bool(edits.get("watermarkBold", False)),
+                italic=bool(edits.get("watermarkItalic", False)),
+            )
+            filters.extend(wm_filters)
+            print(f"🔤 Text watermark: '{wm_text[:30]}' ({len(wm_filters)} layers)")
 
     return filters
 

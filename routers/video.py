@@ -37,6 +37,7 @@ from services.ffmpeg import (
     FFMPEG_BIN,
     build_ffmpeg_filters,
     build_filter_complex_with_images,
+    build_watermark_text_filter,
     get_vignette_png_path,
     build_intro_text_filter,
     safe_delete,
@@ -452,6 +453,23 @@ async def export_clip(
                 intro_font_path = _SYS_FONT
             print(f"📝 Intro font resolved: {intro_font_path}")
 
+        # Resolve font for text watermark
+        watermark_text_font_path: Optional[str] = None
+        wm_type = edits.get("watermarkType", "image")
+        wm_text = edits.get("watermarkText", "") or ""
+        if DRAWTEXT_OK and wm_type == "text" and wm_text.strip():
+            from services.fonts import resolve_google_font, SYSTEM_FONT as _SYS_FONT_WM
+            _wm_font_family = edits.get("watermarkFontFamily", "Montserrat") or "Montserrat"
+            _wm_bold   = bool(edits.get("watermarkBold", False))
+            _wm_italic = bool(edits.get("watermarkItalic", False))
+            try:
+                watermark_text_font_path = await resolve_google_font(
+                    _wm_font_family, bold=_wm_bold, italic=_wm_italic
+                )
+            except Exception:
+                watermark_text_font_path = _SYS_FONT_WM
+            print(f"🔤 Watermark text font resolved: {watermark_text_font_path}")
+
         # Decode & save image overlays ke temp files
         valid_image_overlays: list[dict] = []
         for i, img in enumerate(image_overlays):
@@ -473,6 +491,7 @@ async def export_clip(
             vid_info=vid_info,
             intro_text=intro_text,
             intro_font_path=intro_font_path,
+            watermark_text_font_path=watermark_text_font_path,
         )
 
         # ── Vignette PNG — generate once, overlay via filter_complex ─────────

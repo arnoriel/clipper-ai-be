@@ -95,6 +95,15 @@ class TemplateCreate(BaseModel):
     watermark_y: float = 0.06
     watermark_width: float = 0.18
     watermark_opacity: float = 0.85
+    # ── Text watermark fields (new) ──────────────────────────────────────────
+    watermark_type: str = "image"          # "text" | "image"
+    watermark_text: Optional[str] = None
+    watermark_font_family: str = "Montserrat"
+    watermark_text_color: str = "#FFFFFF"
+    watermark_bold: bool = False
+    watermark_italic: bool = False
+    watermark_font_size: float = 0.04     # relative to frame width
+    # ─────────────────────────────────────────────────────────────────────────
     brightness: float = 0.0
     contrast: float = 0.0
     saturation: float = 0.0
