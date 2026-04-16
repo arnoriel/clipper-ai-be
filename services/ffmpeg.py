@@ -155,48 +155,67 @@ _VIGNETTE_PNG_CACHE: dict[tuple[int, int], Path] = {}
 
 def _make_vignette_array(width: int, height: int) -> "_np.ndarray":
     """
-    Generate RGBA numpy array untuk vintage cinematic frame overlay.
+    Generate RGBA numpy array untuk vintage cinematic FRAME overlay.
 
-    Karakteristik:
-      - Sudut & tepi frame sangat gelap (hitam)
-      - Transisi lembut dari gelap ke transparan menuju tengah
-      - Sedikit inner glow (putih lembut) tepat di tepi dalam frame
-      - Box-SDF shape: lebih rectangular, cocok semua aspect ratio
+    INI BUKAN VIGNETTE — ini adalah FRAME (bingkai film), perbedaannya:
+      • Vignette : gradient gelap dari tepi ke tengah, tengah sedikit gelap
+      • Film Frame: border gelap di 4 sisi, TENGAH 100% TRANSPARAN (alpha=0)
 
-    RGB = hitam frame + sedikit putih untuk inner glow
-    Alpha = 0 (transparan di tengah), naik ke 255 (hitam di tepi)
+    Karakteristik frame ini:
+      - Center frame: alpha = 0 (video tampil penuh, tidak ada penggelapan)
+      - Border frame: alpha = 0.91 (hitam solid di tepi, seperti bingkai kamera)
+      - Sudut: rounded rectangle via SDF → sudut membulat seperti frame proyektor
+      - Inner edge: highlight putih tipis (efek sinar proyektor vintage)
+      - Transisi inner edge: softness 2.5% → garis batas yang jelas, bukan blur lebar
+
+    Parameter:
+      frame_w  = 0.06  → frame 6% dari dimensi di tiap sisi (12% total per axis)
+      corner_r = 0.05  → radius sudut membulat (proporsional terhadap frame)
+      softness = 0.025 → transisi tepi dalam yang cukup halus tapi jelas
     """
-    xs = _np.linspace(-1, 1, width,  dtype=_np.float32)
-    ys = _np.linspace(-1, 1, height, dtype=_np.float32)
+    xs = _np.linspace(0.0, 1.0, width,  dtype=_np.float32)
+    ys = _np.linspace(0.0, 1.0, height, dtype=_np.float32)
     xg, yg = _np.meshgrid(xs, ys)
 
-    # Inner transparent area (box SDF)
-    inner_x  = 0.78   # 78% lebar = area transparan
-    inner_y  = 0.76   # 76% tinggi = area transparan
-    softness = 0.18   # lebar zona transisi
+    # Koordinat relatif dari tengah (0 = tengah, 0.5 = tepi)
+    dx = _np.abs(xg - 0.5)
+    dy = _np.abs(yg - 0.5)
 
-    sdx      = _np.abs(xg) - inner_x
-    sdy      = _np.abs(yg) - inner_y
-    box_dist = _np.maximum(sdx, sdy)   # >0 = luar (frame), <0 = dalam (transparan)
+    # Parameter frame
+    frame_w  = 0.06    # lebar frame di tiap sisi (6% dari dimensi)
+    corner_r = 0.05    # radius sudut rounded rectangle (normalized)
+    softness = 0.025   # softness transisi inner edge — jelas tapi tidak keras
 
-    raw_alpha = _np.clip(box_dist / softness, 0, 1)
+    # Inner clear area: setengah lebar/tinggi dikurangi frame_w
+    inner_hw = 0.5 - frame_w   # = 0.44
+    inner_hh = 0.5 - frame_w   # = 0.44
 
-    # Boost sudut supaya gelap lebih kuat di corner (cinematic feel)
-    corner_boost = (_np.abs(xg) * _np.abs(yg)) ** 0.45
-    frame_alpha  = _np.clip(raw_alpha + corner_boost * 0.12, 0, 1)
-    # Slight base opacity: tepi video tidak pernah 100% terang
-    frame_alpha  = _np.clip(frame_alpha * 0.97 + 0.03, 0, 1)
+    # Rounded Rectangle SDF (Signed Distance Function)
+    # SDF < 0 → di dalam (transparan, tengah frame)
+    # SDF > 0 → di frame border (gelap)
+    # SDF = 0 → tepat di inner edge frame
+    qx  = _np.maximum(dx - (inner_hw - corner_r), 0.0)
+    qy  = _np.maximum(dy - (inner_hh - corner_r), 0.0)
+    sdf = _np.sqrt(qx ** 2 + qy ** 2) - corner_r
 
-    # Inner glow: kilat putih lembut di batas dalam frame
-    norm_dist = box_dist / softness
-    glow_band = _np.clip(1 - _np.abs(norm_dist - 0.05) * 6, 0, 1)
-    glow_rgb  = (_np.clip(glow_band * 0.22 * (1 - frame_alpha), 0, 1) * 255).astype(_np.uint8)
+    # Alpha: 0 = transparan (tengah), 1 = frame border gelap
+    raw_alpha = _np.clip(sdf / softness, 0.0, 1.0)
+
+    # Frame darkness: hampir penuh opaque di tepi
+    frame_strength = 0.91
+    final_alpha    = raw_alpha * frame_strength
+
+    # Inner highlight: kilat putih tipis di inner edge frame (vintage projector feel)
+    # Peak di SDF ≈ 0 (batas dalam frame), melemah ke dalam dan keluar
+    norm_dist = sdf / softness
+    glow_band = _np.clip(1.0 - _np.abs(norm_dist - 0.15) * 4.5, 0.0, 1.0)
+    glow_rgb  = (_np.clip(glow_band * 0.18 * (1.0 - raw_alpha * 0.7), 0.0, 1.0) * 255).astype(_np.uint8)
 
     arr = _np.zeros((height, width, 4), dtype=_np.uint8)
-    arr[:, :, 0] = glow_rgb
-    arr[:, :, 1] = glow_rgb
-    arr[:, :, 2] = glow_rgb
-    arr[:, :, 3] = (frame_alpha * 255).astype(_np.uint8)
+    arr[:, :, 0] = glow_rgb   # R — hitam + sedikit putih di inner edge
+    arr[:, :, 1] = glow_rgb   # G
+    arr[:, :, 2] = glow_rgb   # B
+    arr[:, :, 3] = (final_alpha * 255).astype(_np.uint8)
     return arr
 
 
@@ -215,7 +234,7 @@ def get_vignette_png_path(width: int = 1920, height: int = 1080) -> Optional[Pat
         if cached.exists():
             return cached
 
-    path = TEMP_DIR / f"cinematic_frame_{width}x{height}.png"
+    path = TEMP_DIR / f"cinematic_frame_v3_{width}x{height}.png"
 
     if not (path.exists() and path.stat().st_size > 1000):
         try:
