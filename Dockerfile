@@ -37,7 +37,19 @@ RUN mkdir -p /tmp/clipper-ai/fonts
 # Expose port (Render inject $PORT otomatis)
 EXPOSE 3001
 
-# Gunakan sh -c agar $PORT bisa di-expand dari environment
-# --workers 1: Render free plan punya RAM terbatas (~512MB), 1 worker sudah cukup
-# --timeout-keep-alive 65: sedikit lebih lama dari default 5s agar koneksi ke Supabase tidak drop
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-3001} --workers 1 --timeout-keep-alive 65"]
+# Gunicorn + UvicornWorker — optimal untuk Render 8 GB / 6 core
+# --workers 4        : 4 process paralel, masing-masing handle request sendiri
+#                      → FFmpeg encode 1 user tidak block user lain
+# --worker-connections 50 : max concurrent connections per worker
+# --timeout 120      : FFmpeg long encode bisa 60-90s, beri slack cukup
+# --keep-alive 65    : sedikit lebih lama dari default agar koneksi Supabase tidak drop
+# --graceful-timeout 30 : kasih waktu worker selesaikan request sebelum di-restart
+CMD ["sh", "-c", "gunicorn main:app \
+  -k uvicorn.workers.UvicornWorker \
+  --workers 4 \
+  --worker-connections 50 \
+  --bind 0.0.0.0:${PORT:-3001} \
+  --timeout 120 \
+  --keep-alive 65 \
+  --graceful-timeout 30 \
+  --log-level info"]

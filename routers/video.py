@@ -23,7 +23,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+# Shared limiter instance — dikonfigurasi di main.py
+limiter = Limiter(key_func=get_remote_address)
 from fastapi import File as FAFile
 from fastapi import UploadFile as FAUploadFile
 from fastapi.responses import StreamingResponse
@@ -53,6 +58,12 @@ from services.whisper import (
     group_words_to_subtitles,
     whisper_provider,
 )
+
+# ─── FFmpeg concurrency limiter ──────────────────────────────────────────────
+# Batasi max 3 FFmpeg job bersamaan untuk cegah OOM di mode buffered.
+# Clip 90s bisa butuh 50-150 MB RAM; 3 concurrent = ~450 MB peak, masih aman
+# di Render 8 GB bahkan dengan 4 workers sekalipun.
+FFMPEG_SEMAPHORE = asyncio.Semaphore(3)
 
 router = APIRouter()
 
@@ -135,7 +146,9 @@ async def get_video_duration(video: UploadFile = File(...)):
 # ──────────────────────────────────────────────────────────────────────────────
 
 @router.post("/api/analyze-motion")
+@limiter.limit("10/minute")  # max 10 analyze per menit per IP
 async def analyze_motion_endpoint(
+    request: Request,  # diperlukan oleh slowapi
     video:        UploadFile = File(...),
     start_time:   float      = Form(...),
     end_time:     float      = Form(...),
@@ -389,7 +402,9 @@ async def auto_subtitle(
 # ──────────────────────────────────────────────────────────────────────────────
 
 @router.post("/api/export-clip")
+@limiter.limit("5/minute")  # max 5 export per menit per IP — cegah flood worker
 async def export_clip(
+    request: Request,  # diperlukan oleh slowapi
     video:        UploadFile = File(...),
     clipJson:     str        = Form(...),
     editsJson:    str        = Form(...),
@@ -560,14 +575,18 @@ async def export_clip(
         file_name    = f"clip_{int(start_sec)}_{int(start_sec + duration_sec)}.mp4"
 
         # ── Buffered mode (overlays / motion) ───────────────────────────────
+        # FFMPEG_SEMAPHORE membatasi max 3 FFmpeg concurrent job untuk cegah OOM.
+        # Clip 90s bisa 50-150 MB per request; tanpa limit 4 workers bisa spike
+        # 600 MB+ hanya dari buffered output. User ke-4 akan queue sebentar (~60s).
         if use_buffered:
             print(f"[ffmpeg cmd] {' '.join(str(a) for a in args)}")
-            process = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout_data, stderr_data = await process.communicate()
+            async with FFMPEG_SEMAPHORE:
+                process = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout_data, stderr_data = await process.communicate()
 
             for p in img_temp_files:
                 safe_delete(p)

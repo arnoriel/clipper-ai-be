@@ -2,6 +2,7 @@
 services/whisper.py — Whisper STT helpers (Groq → OpenAI → local fallback).
 """
 
+import asyncio
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -32,6 +33,13 @@ async def extract_audio_segment(
     duration_sec: float,
     output_path: Path,
 ) -> bool:
+    """
+    Extract audio segment dari video menggunakan FFmpeg.
+
+    PENTING: Menggunakan asyncio.create_subprocess_exec (non-blocking) bukan
+    subprocess.run() yang akan membekukan entire event loop FastAPI selama
+    proses berjalan (bisa 3-10 detik untuk audio 60s).
+    """
     cmd = [
         FFMPEG_BIN, "-y",
         "-ss", str(start_sec),
@@ -43,7 +51,12 @@ async def extract_audio_segment(
         "-ar",     "16000",
         str(output_path),
     ]
-    proc = subprocess.run(cmd, capture_output=True, timeout=120)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
     return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 100
 
 
@@ -140,8 +153,6 @@ def call_whisper_local(audio_path: Path, language: Optional[str] = None) -> dict
 
 
 async def call_whisper_api(audio_path: Path, language: Optional[str] = None) -> dict:
-    import asyncio
-
     provider, _ = whisper_provider()
     print(f"🎙️  STT provider: {provider}")
 
