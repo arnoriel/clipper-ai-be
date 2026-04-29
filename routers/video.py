@@ -686,3 +686,181 @@ async def export_clip(
             safe_delete(p)
         print(f"[export exception] {e}")
         raise HTTPException(500, f"Export failed: {str(e)}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Real-time progress stream untuk analyze-video via SSE
+# Client baca stream ini, dapat progress pct 0-100 + result akhir
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.post("/api/analyze-video-stream")
+async def analyze_video_stream(
+    file_name:    str   = Form(...),
+    file_size:    int   = Form(...),
+    duration:     float = Form(...),
+    mime_type:    str   = Form(default="video/mp4"),
+    num_clips:    int   = Form(default=5),
+    current_user: dict  = Depends(get_current_user),
+):
+    """
+    SSE endpoint — kirim progress event real-time ke frontend:
+      data: {"type":"progress","pct":N,"stage":"loading|analyzing|processing","msg":"..."}
+      data: {"type":"result","data":{...VideoAnalysisResult...}}
+      data: {"type":"error","code":"...","msg":"..."}
+
+    Stage mapping (pct):
+      0-20   → loading    (cek kredit, siapkan AI)
+      20-65  → analyzing  (tunggu OpenRouter — pulse setiap 1.5 s)
+      65-95  → processing (parse JSON, hitung momen, deduct kredit)
+      100    → done
+    """
+    num_clips = max(1, min(7, num_clips))
+
+    def _evt(payload: dict) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    async def generate():
+        try:
+            # ── Stage 1: Loading AI (0-20%) ──────────────────────────────
+            yield _evt({"type": "progress", "pct": 5,  "stage": "loading", "msg": "Loading AI..."})
+            await asyncio.sleep(0.1)
+
+            credits = await supa_get_user_credits(current_user["sub"])
+            if credits <= 0:
+                yield _evt({"type": "error", "code": "INSUFFICIENT_CREDITS",
+                            "msg": "Kredit tidak cukup. Silakan top up kredit kamu."})
+                return
+
+            yield _evt({"type": "progress", "pct": 12, "stage": "loading", "msg": "Loading AI..."})
+            await asyncio.sleep(0.1)
+            yield _evt({"type": "progress", "pct": 18, "stage": "loading", "msg": "Loading AI..."})
+            await asyncio.sleep(0.1)
+
+            # ── Stage 2: AI Generating Moments (20-65%) ──────────────────
+            yield _evt({"type": "progress", "pct": 22, "stage": "analyzing", "msg": "AI Generating Moments..."})
+
+            def fmt_time(s: float) -> str:
+                h, rem = divmod(int(s), 3600)
+                m, sec = divmod(rem, 60)
+                return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+            file_size_mb  = file_size / 1_048_576
+            system_prompt = (
+                "Kamu adalah analis konten viral profesional. "
+                "SELALU respons Bahasa Indonesia. Hanya JSON valid."
+            )
+            user_prompt = (
+                f"Analisis file video dan identifikasi TEPAT {num_clips} momen viral terbaik "
+                f"yang paling berpotensi viral di media sosial.\n\n"
+                f"INFO: nama={file_name}, ukuran={file_size_mb:.1f}MB, "
+                f"durasi={duration}s ({fmt_time(duration)}), format={mime_type}\n\n"
+                f"Distribusi merata di seluruh video:\n"
+                f"- 0-{duration*0.25:.0f}s (bagian awal)\n"
+                f"- {duration*0.25:.0f}-{duration*0.5:.0f}s (bagian tengah awal)\n"
+                f"- {duration*0.5:.0f}-{duration*0.75:.0f}s (bagian tengah akhir)\n"
+                f"- {duration*0.75:.0f}-{duration}s (bagian akhir)\n\n"
+                f"Aturan WAJIB:\n"
+                f"- Kembalikan TEPAT {num_clips} momen, tidak lebih tidak kurang\n"
+                f"- Gunakan integer detik, durasi 15-90s per clip\n"
+                f"- Tidak boleh overlap antar momen\n"
+                f"- Tidak melebihi {duration}s\n"
+                f"- Pilih momen dengan viralScore tertinggi\n"
+                f"- Kategori: funny/emotional/educational/shocking/satisfying/drama/highlight\n\n"
+                f'JSON:\n{{"summary":"...","totalViralPotential":7,"moments":[{{"id":"moment_1","label":"...",'
+                f'"startTime":10,"endTime":55,"reason":"...","viralScore":8,"category":"highlight"}}]}}'
+            )
+
+            # Jalankan OpenRouter call sebagai asyncio task agar bisa pulse progress saat menunggu
+            ai_task = asyncio.create_task(
+                call_openrouter(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": user_prompt},
+                    ],
+                    max_tokens=3000,
+                    temperature=0.3,
+                )
+            )
+
+            # Pulse progress 22→63% selama AI bekerja (setiap 1.5 detik naik ~4%)
+            pct = 22
+            while not ai_task.done():
+                await asyncio.sleep(1.5)
+                if pct < 63:
+                    pct = min(63, pct + 4)
+                yield _evt({"type": "progress", "pct": pct, "stage": "analyzing",
+                            "msg": "AI Generating Moments..."})
+
+            content = await ai_task  # ambil hasil (exception juga di-re-raise di sini)
+
+            # ── Stage 3: Processing results (65-95%) ─────────────────────
+            yield _evt({"type": "progress", "pct": 70, "stage": "processing",
+                        "msg": "AI Generating Moments..."})
+
+            cleaned = re.sub(r"```json\s*|```\s*", "", content).strip()
+            try:
+                parsed = json.loads(cleaned)
+            except json.JSONDecodeError:
+                match = re.search(r"[\[{][\s\S]*[\]}]", cleaned)
+                if not match:
+                    yield _evt({"type": "error", "msg": "AI returned invalid JSON"})
+                    return
+                parsed = json.loads(match.group(0))
+
+            yield _evt({"type": "progress", "pct": 80, "stage": "processing",
+                        "msg": "AI Generating Moments..."})
+
+            moments = []
+            for i, m in enumerate(parsed.get("moments", [])):
+                start = round(m.get("startTime", 0))
+                end   = round(m.get("endTime", 0))
+                if start < 0 or end > duration or start >= end or (end - start) < 10:
+                    continue
+                moments.append({
+                    **m,
+                    "id":         m.get("id") or f"moment_{i + 1}",
+                    "startTime":  start,
+                    "endTime":    min(end, int(duration)),
+                    "viralScore": max(1, min(10, m.get("viralScore", 5))),
+                })
+
+            moments.sort(key=lambda x: x["viralScore"], reverse=True)
+            moments = moments[:num_clips]
+
+            yield _evt({"type": "progress", "pct": 88, "stage": "processing",
+                        "msg": "AI Generating Moments..."})
+
+            deducted  = await supa_deduct_credit(current_user["sub"])
+            remaining = await supa_get_user_credits(current_user["sub"])
+            if deducted:
+                print(
+                    f"💳 Credit deducted: user={current_user['email']} "
+                    f"| analyze-video-stream | remaining={remaining}"
+                )
+
+            yield _evt({"type": "progress", "pct": 95, "stage": "processing",
+                        "msg": "AI Generating Moments..."})
+
+            result_payload = {
+                "moments":             moments,
+                "summary":             parsed.get("summary", "Analisis selesai."),
+                "totalViralPotential": parsed.get("totalViralPotential", 5),
+                "credits_remaining":   remaining,
+            }
+
+            yield _evt({"type": "progress", "pct": 100, "stage": "done", "msg": "Selesai!"})
+            yield _evt({"type": "result",   "data": result_payload})
+
+        except Exception as e:
+            err_msg = str(e)
+            code    = "INSUFFICIENT_CREDITS" if "402" in err_msg or "Kredit" in err_msg else "SERVER_ERROR"
+            yield _evt({"type": "error", "code": code, "msg": err_msg[:300]})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",   # matikan buffering nginx agar SSE langsung terkirim
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
